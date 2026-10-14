@@ -32,6 +32,17 @@ jobs:
         shell: bash
         run: echo "version=$(python -c "import activity_logger; print(activity_logger.__version__)")" >> "$GITHUB_OUTPUT"
 
+      - name: Bake in the client data-repo token
+        shell: bash
+        # Overwrites the committed (empty) placeholder with the real secret,
+        # only inside this ephemeral build — never committed back to the repo.
+        # If the secret isn't set, the placeholder stays empty and the built
+        # .exe simply runs with central sync disabled (same as a dev build).
+        run: |
+          cat > activity_logger/_embedded.py <<EOF
+          CLIENT_DATA_TOKEN = "${{ secrets.CLIENT_DATA_TOKEN }}"
+          EOF
+
       - name: Build logger exe (for employee machines)
         run: pyinstaller --onefile --noconsole --name MAN_inspection main.py
 

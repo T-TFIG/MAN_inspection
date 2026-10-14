@@ -1,8 +1,0 @@
-{
-  "enabled": true,
-  "recipient_email": "nathaphong.meng@gmail.com",
-  "schedule": "daily",
-  "send_time": "18:00",
-  "day_of_week": "mon",
-  "day_of_month": 1
-}

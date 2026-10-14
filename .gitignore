@@ -23,6 +23,14 @@ email_config.json
 # Runtime state written next to the program in dev (lives in ProgramData when built)
 policy_cache.json
 email_state.json
+central_policy_cache.json
+central_sha_cache.json
+upload_state.json
+machine_id.txt
 
 # Admin console's saved GitHub token — never commit
 admin_settings.json
+
+# NOTE: activity_logger/_embedded.py IS committed (with an empty token as a
+# placeholder) — CI overwrites its content transiently during the build only,
+# from the CLIENT_DATA_TOKEN secret. Never add it here.

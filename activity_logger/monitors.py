@@ -16,6 +16,7 @@ import queue
 import threading
 import time
 from ctypes import wintypes
+from types import SimpleNamespace
 
 import psutil
 import win32api
@@ -67,9 +68,17 @@ def foreground_window() -> tuple[str, str]:
 
 
 class Poller(threading.Thread):
-    def __init__(self, event_queue: "queue.Queue[Event]"):
+    def __init__(self, event_queue: "queue.Queue[Event]", settings=None):
         super().__init__(name="Poller", daemon=True)
         self._queue = event_queue
+        # A RuntimeSettings instance the admin can change centrally (poll
+        # interval, idle threshold, which event kinds to emit at all). Falls
+        # back to the static config defaults if none is supplied.
+        self._settings = settings or SimpleNamespace(
+            poll_interval_sec=config.POLL_INTERVAL_SEC,
+            idle_threshold_sec=config.IDLE_THRESHOLD_SEC,
+            track_window=True, track_idle=True,
+        )
         self._stop = threading.Event()
         self._cur_app = ""
         self._cur_title = ""
@@ -86,7 +95,7 @@ class Poller(threading.Thread):
         self._seg_start = time.monotonic()
         self._have_segment = True
 
-        while not self._stop.wait(config.POLL_INTERVAL_SEC):
+        while not self._stop.wait(self._settings.poll_interval_sec):
             self._tick()
 
         # Flush the final in-progress segment on shutdown.
@@ -95,7 +104,7 @@ class Poller(threading.Thread):
     def _tick(self) -> None:
         idle = idle_seconds()
 
-        if idle >= config.IDLE_THRESHOLD_SEC:
+        if idle >= self._settings.idle_threshold_sec:
             if not self._is_idle:
                 # Entered idle: close the window segment that was running.
                 self._close_segment()
@@ -106,13 +115,15 @@ class Poller(threading.Thread):
         # Not idle.
         if self._is_idle:
             idle_duration = time.monotonic() - self._seg_start
-            self._emit(Event("Idle", detail="idle period", duration=idle_duration))
+            if self._settings.track_idle:
+                self._emit(Event("Idle", detail="idle period", duration=idle_duration))
             self._is_idle = False
             # Start a fresh window segment on resume.
             self._cur_app, self._cur_title = foreground_window()
             self._seg_start = time.monotonic()
             self._have_segment = True
-            self._emit(Event("Active", self._cur_app, self._cur_title))
+            if self._settings.track_idle:
+                self._emit(Event("Active", self._cur_app, self._cur_title))
             return
 
         app, title = foreground_window()
@@ -126,7 +137,7 @@ class Poller(threading.Thread):
         if not self._have_segment:
             return
         duration = time.monotonic() - self._seg_start
-        if self._cur_app or self._cur_title:
+        if self._settings.track_window and (self._cur_app or self._cur_title):
             self._emit(Event("Window", self._cur_app, self._cur_title,
                              duration=duration))
         self._have_segment = False
@@ -164,9 +175,11 @@ def _unitmask_to_drives(mask: int) -> str:
 
 
 class MessageWindow(threading.Thread):
-    def __init__(self, event_queue: "queue.Queue[Event]"):
+    def __init__(self, event_queue: "queue.Queue[Event]", settings=None):
         super().__init__(name="MessageWindow", daemon=True)
         self._queue = event_queue
+        self._settings = settings or SimpleNamespace(track_usb=True,
+                                                      track_session=True)
         self._hwnd = None
         self._ready = threading.Event()
 
@@ -216,7 +229,7 @@ class MessageWindow(threading.Thread):
     def _wndproc(self, hwnd, msg, wparam, lparam):
         if msg == WM_WTSSESSION_CHANGE:
             kind = _SESSION_EVENTS.get(wparam)
-            if kind:
+            if kind and self._settings.track_session:
                 self._queue.put(Event(kind, detail="session"))
             return 0
 
@@ -235,6 +248,8 @@ class MessageWindow(threading.Thread):
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
     def _handle_device_change(self, wparam, lparam):
+        if not self._settings.track_usb:
+            return
         if wparam not in (DBT_DEVICEARRIVAL, DBT_DEVICEREMOVECOMPLETE):
             return
         if not lparam:

@@ -11,15 +11,17 @@ GITHUB_REPO = "MAN_inspection"
 # output name in .github/workflows/build.yml).
 RELEASE_ASSET_NAME = "MAN_inspection.exe"
 
-# --- Central (admin-controlled) email policy --------------------------------
-# Endpoints pull this JSON from the repo. The admin changes it in one place
-# (edit remote_policy.json on GitHub) and every machine follows on next refresh.
-# It contains NO secrets (recipient + schedule only).
-POLICY_URL = (
-    f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/main/"
-    "remote_policy.json"
-)
-POLICY_REFRESH_INTERVAL_SEC = 30 * 60   # re-pull the policy every 30 minutes
+# --- Private data backend (policy / machine status / uploaded logs) --------
+# A SEPARATE private repo, holding no source code, used as a lightweight
+# central store: policy/policy.json, status/<machine_id>.json (heartbeats),
+# logs/<machine_id>/*.xlsx (uploaded reports). Employee machines write to this
+# repo using a token baked in at build time (see activity_logger/_embedded.py),
+# scoped to ONLY this repo's Contents — never the public code repo above.
+DATA_REPO_OWNER = "T-TFIG"
+DATA_REPO_NAME = "MAN_inspection-data"
+POLICY_PATH = "policy/policy.json"
+
+HEARTBEAT_INTERVAL_SEC_DEFAULT = 5 * 60   # overridden by policy.json if set
 
 # --- Behaviour tuning -------------------------------------------------------
 POLL_INTERVAL_SEC = 2.0          # how often we sample the foreground window

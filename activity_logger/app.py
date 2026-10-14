@@ -1,26 +1,32 @@
-"""Wires the monitors, Excel writer, updater and tray icon together."""
+"""Wires the monitors, Excel writer, updater, central sync and tray together."""
 
 import queue
 import threading
 import time
+from datetime import date
 
-from . import __version__, config
+from . import __version__, central, config
 from . import emailer, updater
 from .emailer import EmailScheduler
 from .events import Event
 from .excel_writer import ExcelWriter
 from .monitors import MessageWindow, Poller
+from .settings import RuntimeSettings
 from .tray import Tray
 
 
 class App:
     def __init__(self):
         self._queue: "queue.Queue[Event]" = queue.Queue()
+        self._settings = RuntimeSettings()
         self._writer = ExcelWriter(self._queue)
-        self._poller = Poller(self._queue)
-        self._msgwin = MessageWindow(self._queue)
-        self._tray = Tray(on_quit=self.stop, on_send_now=self._send_now)
+        self._poller = Poller(self._queue, self._settings)
+        self._msgwin = MessageWindow(self._queue, self._settings)
+        self._tray = Tray(on_quit=self.stop, on_send_now=self._send_now,
+                          on_upload_now=self._upload_now)
         self._email_scheduler = EmailScheduler(notify=self._on_email_result)
+        self._central_sync = central.CentralSync(self._settings,
+                                                 notify=self._on_upload_result)
         self._stopping = threading.Event()
 
     def start(self) -> None:
@@ -36,6 +42,8 @@ class App:
         self._poller.start()
         self._msgwin.start()
         self._email_scheduler.start()
+        if central.is_configured():
+            self._central_sync.start()
         self._queue.put(Event("Start", detail=f"v{__version__}"))
 
         self._update_thread = threading.Thread(
@@ -54,6 +62,7 @@ class App:
         self._poller.stop()
         self._msgwin.stop()
         self._email_scheduler.stop()
+        self._central_sync.stop()
         # Give the writer a moment to flush the final events, then stop it.
         time.sleep(0.5)
         self._writer.stop()
@@ -63,8 +72,16 @@ class App:
         ok, info = emailer.send_today()
         self._on_email_result(ok, info)
 
+    def _upload_now(self) -> None:
+        ok, info = central.upload_logs([date.today()])
+        self._on_upload_result(ok, info)
+
     def _on_email_result(self, ok: bool, info: str) -> None:
         prefix = "Log emailed" if ok else "Email not sent"
+        self._tray.notify(f"{prefix}: {info}")
+
+    def _on_upload_result(self, ok: bool, info: str) -> None:
+        prefix = "Log uploaded" if ok else "Upload not sent"
         self._tray.notify(f"{prefix}: {info}")
 
     def _periodic_update_loop(self) -> None:

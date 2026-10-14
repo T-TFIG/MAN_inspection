@@ -1,20 +1,19 @@
-"""Send the Excel log(s) by email via Gmail SMTP, under central admin control.
+"""Send the Excel log(s) by email via Gmail SMTP — now an OPTIONAL channel.
 
-Two layers of configuration:
+The default, always-available transport is the central upload in
+:mod:`activity_logger.central` (no per-machine secret needed at all). Email is
+kept as an extra channel for admins who still want a copy in their inbox.
+
+Two layers of configuration, same split as before:
 
 * **Local secret** (``email_config.json``) — the sending Gmail account and its
-  App Password. Deployed ONCE per machine by the admin (ideally into
-  ``%PROGRAMDATA%\\MAN_inspection``). Contains secrets, so it is never committed
-  to the public repo and never baked into the released .exe.
+  App Password. Deployed ONCE per machine by the admin. Never committed to the
+  repo, never baked into the released .exe.
 
-* **Remote policy** (``remote_policy.json`` in the repo) — enabled flag,
-  recipient address and the send schedule (daily / weekly / monthly). The admin
-  edits this one file on GitHub and every endpoint follows on the next refresh.
-  It holds NO secrets. Employees cannot change it (no push access).
-
-The effective settings are the remote policy layered over the local file, with
-secrets only ever coming from the local file. If the policy cannot be fetched,
-the last cached copy is used; if there is none, email stays disabled.
+* **Central policy** (the ``email`` section of ``policy/policy.json`` in the
+  private data repo) — enabled flag, recipient and schedule. Shares the same
+  fetch/cache as the rest of the central policy (see :mod:`central`), so this
+  module does not make its own network calls.
 
 Gmail requires an *App Password* (2-step verification must be on); a normal
 account password will not work for SMTP.
@@ -27,12 +26,9 @@ import smtplib
 import ssl
 import tempfile
 import threading
-from datetime import date, datetime, timedelta
-from email.message import EmailMessage
+from datetime import date, datetime
 
-import requests
-
-from . import config
+from . import central, config, scheduling
 from .excel_writer import _path_for
 
 XLSX_MIME = "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -44,20 +40,6 @@ DEFAULT_LOCAL = {
     "sender_email": "",
     "app_password": "",
     "recipient_email": "",   # fallback recipient if the policy omits one
-}
-
-# Remote policy: what the admin changes centrally (no secrets).
-DEFAULT_POLICY = {
-    "enabled": False,
-    "recipient_email": "",
-    "schedule": "daily",      # "daily" | "weekly" | "monthly"
-    "send_time": "18:00",     # 24h local time
-    "day_of_week": "mon",     # weekly: mon..sun
-    "day_of_month": 1,        # monthly: 1..28
-}
-
-_WEEKDAYS = {
-    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
 }
 
 
@@ -97,46 +79,12 @@ def load_local_config() -> dict:
     return dict(DEFAULT_LOCAL)
 
 
-# --- remote policy (admin-controlled, cached locally) -----------------------
-
-
-def _policy_cache_path() -> str:
-    return os.path.join(config.data_dir(), "policy_cache.json")
-
-
-def fetch_policy() -> dict:
-    """Pull the central policy; fall back to the last cached copy, then defaults."""
-    try:
-        resp = requests.get(config.POLICY_URL, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, dict):
-            try:
-                with open(_policy_cache_path(), "w", encoding="utf-8") as fh:
-                    json.dump(data, fh, indent=2)
-            except Exception:
-                pass
-            merged = dict(DEFAULT_POLICY)
-            merged.update(data)
-            return merged
-    except Exception:
-        pass
-
-    try:
-        with open(_policy_cache_path(), encoding="utf-8") as fh:
-            data = json.load(fh)
-        merged = dict(DEFAULT_POLICY)
-        if isinstance(data, dict):
-            merged.update(data)
-        return merged
-    except Exception:
-        return dict(DEFAULT_POLICY)
+# --- effective settings (central policy's "email" section + local secret) --
 
 
 def effective_config() -> dict:
-    """Local secrets overlaid with the central policy."""
     local = load_local_config()
-    policy = fetch_policy()
+    policy = central.fetch_policy()["email"]
     return {
         "enabled": bool(policy.get("enabled", False)),
         "recipient_email": (policy.get("recipient_email")
@@ -152,22 +100,12 @@ def effective_config() -> dict:
     }
 
 
-# --- which days to attach for a given schedule ------------------------------
-
-
-def dates_for_schedule(schedule: str, ref: date) -> list[date]:
-    if schedule == "weekly":
-        start = ref - timedelta(days=ref.weekday())  # Monday of this week
-        return [start + timedelta(days=i) for i in range((ref - start).days + 1)]
-    if schedule == "monthly":
-        return [ref.replace(day=d) for d in range(1, ref.day + 1)]
-    return [ref]  # daily
-
-
 # --- sending ----------------------------------------------------------------
 
 
-def _attach_file(msg: EmailMessage, path: str) -> bool:
+def _attach_file(msg, path: str) -> bool:
+    from email.message import EmailMessage
+    assert isinstance(msg, EmailMessage)
     tmp = None
     try:
         fd, tmp = tempfile.mkstemp(suffix=".xlsx")
@@ -188,7 +126,9 @@ def _attach_file(msg: EmailMessage, path: str) -> bool:
     return True
 
 
-def send_logs(dates: list[date], label: str = "") -> tuple[bool, str]:
+def send_logs(dates: list, label: str = "") -> tuple[bool, str]:
+    from email.message import EmailMessage
+
     cfg = effective_config()
     if not cfg["enabled"]:
         return False, "email disabled by policy"
@@ -253,7 +193,6 @@ class EmailScheduler(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
 
-    # -- de-dup state persistence --
     def _state_path(self) -> str:
         return os.path.join(config.data_dir(), "email_state.json")
 
@@ -283,11 +222,11 @@ class EmailScheduler(threading.Thread):
         if not cfg["enabled"]:
             return
         now = datetime.now()
-        key = self._due_key(cfg, now)
+        key = scheduling.due_key(cfg, now)
         if key is None or key == self._last_key:
             return
 
-        dates = dates_for_schedule(cfg["schedule"], now.date())
+        dates = scheduling.dates_for_schedule(cfg["schedule"], now.date())
         ok, info = send_logs(dates)
         if ok:
             # Only mark done on success, so a transient failure retries later.
@@ -295,28 +234,3 @@ class EmailScheduler(threading.Thread):
             self._save_state(key)
         if self._notify:
             self._notify(ok, info)
-
-    @staticmethod
-    def _due_key(cfg: dict, now: datetime):
-        """Return a unique key if a send is due at/after send_time, else None."""
-        try:
-            hh, mm = (int(x) for x in str(cfg["send_time"]).split(":"))
-            target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        except Exception:
-            return None
-        if now < target:
-            return None
-
-        schedule = cfg["schedule"]
-        if schedule == "weekly":
-            want = _WEEKDAYS.get(str(cfg["day_of_week"]).lower()[:3], 0)
-            if now.weekday() != want:
-                return None
-            iso = now.isocalendar()
-            return f"W{iso[0]}-{iso[1]}"
-        if schedule == "monthly":
-            if now.day != cfg["day_of_month"]:
-                return None
-            return f"M{now.year}-{now.month:02d}"
-        # daily
-        return f"D{now.date().isoformat()}"
