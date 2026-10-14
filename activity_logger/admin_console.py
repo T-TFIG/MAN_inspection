@@ -14,6 +14,7 @@ employees run the logger, not this console.
 import base64
 import json
 import os
+import queue
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -96,15 +97,39 @@ def save_token(token: str) -> None:
         pass
 
 
+def _is_ascii(text: str) -> bool:
+    try:
+        text.encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 # --- GUI --------------------------------------------------------------------
 
 
 class AdminConsole(tk.Tk):
     def __init__(self):
         super().__init__()
+        # Workaround for a Tk/Windows bug: on non-English system locales (e.g.
+        # Thai, cp874) Tcl can decode clipboard paste using the OS ANSI
+        # codepage instead of UTF-8, silently corrupting pasted ASCII secrets
+        # (a GitHub token turns into garbled Thai characters). Forcing Tcl's
+        # system encoding to utf-8 up front avoids that misinterpretation.
+        try:
+            self.tk.call("encoding", "system", "utf-8")
+        except Exception:
+            pass
+
         self.title(f"MAN_inspection — Admin Console v{__version__}")
         self.resizable(False, False)
         self._sha = None
+        # Background threads never touch Tk widgets directly (Tk is not
+        # thread-safe and calling .after()/widget methods from another thread
+        # can silently stop updating the UI on some platforms/locales). They
+        # only push callables here; the main thread drains it on a timer.
+        self._ui_queue: "queue.Queue[callable]" = queue.Queue()
+        self.after(100, self._drain_ui_queue)
 
         self.var_enabled = tk.BooleanVar(value=False)
         self.var_recipient = tk.StringVar()
@@ -160,8 +185,14 @@ class AdminConsole(tk.Tk):
         ttk.Label(gh, text=f"Repo: {config.GITHUB_OWNER}/{config.GITHUB_REPO}").grid(
             row=0, column=0, columnspan=2, sticky="w", **pad)
         ttk.Label(gh, text="Access token:").grid(row=1, column=0, sticky="e", **pad)
-        ttk.Entry(gh, textvariable=self.var_token, width=34, show="*").grid(
+        ttk.Entry(gh, textvariable=self.var_token, width=30, show="*").grid(
             row=1, column=1, sticky="w", **pad)
+        # A dedicated Paste button bypasses the regular Ctrl+V/clipboard path,
+        # which is where non-English Windows locales can corrupt the text (see
+        # the encoding workaround in __init__). This reads the clipboard
+        # explicitly as UTF-8 text.
+        ttk.Button(gh, text="Paste", width=6, command=self._paste_token).grid(
+            row=1, column=2, sticky="w", padx=(0, 8))
 
         btns = ttk.Frame(self)
         btns.grid(row=2, column=0, sticky="ew", padx=10, pady=6)
@@ -189,11 +220,55 @@ class AdminConsole(tk.Tk):
         self.var_status.set(msg)
         self.update_idletasks()
 
+    def _drain_ui_queue(self) -> None:
+        """Runs on the main thread: executes anything workers queued up."""
+        try:
+            while True:
+                job = self._ui_queue.get_nowait()
+                job()
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._drain_ui_queue)
+
+    def _paste_token(self) -> None:
+        """Paste the clipboard into the token field, forcing UTF-8 text.
+
+        Works around a Tk/Windows bug where normal Ctrl+V paste on a
+        non-English system locale can reinterpret the clipboard through the
+        OS ANSI codepage and silently corrupt an ASCII secret.
+        """
+        try:
+            text = self.clipboard_get()
+        except Exception as exc:
+            messagebox.showerror("Clipboard", f"Could not read clipboard: {exc}")
+            return
+        text = text.strip()
+        if not _is_ascii(text):
+            messagebox.showerror(
+                "Pasted text looks corrupted",
+                "The clipboard text contains non-ASCII characters, which a "
+                "GitHub token never does. Try copying the token again from "
+                "GitHub and paste once more.",
+            )
+            return
+        self.var_token.set(text)
+        self._status("Token pasted.")
+
     # -- actions (network off the UI thread) --
     def _load(self) -> None:
         token = self.var_token.get().strip()
         if not token:
             messagebox.showwarning("Token needed", "Enter a GitHub access token first.")
+            return
+        if not _is_ascii(token):
+            messagebox.showerror(
+                "Token looks corrupted",
+                "The token field contains non-ASCII characters (a GitHub "
+                "token is always plain ASCII). This usually happens when "
+                "pasting on a non-English Windows locale — clear the field "
+                "and use the 'Paste' button instead of Ctrl+V.",
+            )
             return
         save_token(token)
         self._status("Loading current policy...")
@@ -203,9 +278,9 @@ class AdminConsole(tk.Tk):
         try:
             policy, sha = get_remote_policy(token)
         except Exception as exc:
-            self.after(0, lambda: self._status(f"Load failed: {exc}"))
+            self._ui_queue.put(lambda: self._status(f"Load failed: {exc}"))
             return
-        self.after(0, lambda: self._apply_policy(policy, sha))
+        self._ui_queue.put(lambda: self._apply_policy(policy, sha))
 
     def _apply_policy(self, policy: dict, sha: str | None) -> None:
         self._sha = sha
@@ -247,6 +322,15 @@ class AdminConsole(tk.Tk):
         if not token:
             messagebox.showwarning("Token needed", "Enter a GitHub access token first.")
             return
+        if not _is_ascii(token):
+            messagebox.showerror(
+                "Token looks corrupted",
+                "The token field contains non-ASCII characters (a GitHub "
+                "token is always plain ASCII). This usually happens when "
+                "pasting on a non-English Windows locale — clear the field "
+                "and use the 'Paste' button instead of Ctrl+V.",
+            )
+            return
         policy = self._collect()
         if policy is None:
             return
@@ -263,10 +347,10 @@ class AdminConsole(tk.Tk):
                 _, sha = get_remote_policy(token)
             new_sha = put_remote_policy(token, policy, sha)
         except Exception as exc:
-            self.after(0, lambda: self._status(f"Publish failed: {exc}"))
+            self._ui_queue.put(lambda: self._status(f"Publish failed: {exc}"))
             return
         self._sha = new_sha
-        self.after(0, lambda: self._status(
+        self._ui_queue.put(lambda: self._status(
             "Published. Machines will apply it within ~30 minutes."))
 
 
