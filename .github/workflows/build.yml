@@ -1,0 +1,44 @@
+name: build-and-release
+
+# Builds the .exe and publishes it as a GitHub Release whenever code is pushed
+# to main. The release tag is taken from __version__ in the package, so bump
+# that version when you want installed copies to auto-update.
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "version=$(python -c "import activity_logger; print(activity_logger.__version__)")" >> "$GITHUB_OUTPUT"
+
+      - name: Build exe
+        run: pyinstaller --onefile --noconsole --name MAN_inspection main.py
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: MAN_inspection v${{ steps.ver.outputs.version }}
+          files: dist/MAN_inspection.exe
+          fail_on_unmatched_files: true

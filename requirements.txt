@@ -1,0 +1,7 @@
+pywin32>=306
+psutil>=5.9
+openpyxl>=3.1
+requests>=2.31
+packaging>=23.0
+pystray>=0.19
+Pillow>=10.0
