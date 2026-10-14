@@ -1,0 +1,8 @@
+{
+  "_comment": "LOCAL SECRET FILE. Copy to email_config.json and deploy ONCE per machine (ideally to C:\\ProgramData\\MAN_inspection\\email_config.json). NEVER commit the real file. Only the sending account + App Password live here; recipient and schedule are controlled centrally in remote_policy.json.",
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "sender_email": "your-admin-gmail@gmail.com",
+  "app_password": "abcd efgh ijkl mnop",
+  "recipient_email": ""
+}

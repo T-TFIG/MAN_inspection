@@ -11,6 +11,16 @@ GITHUB_REPO = "MAN_inspection"
 # output name in .github/workflows/build.yml).
 RELEASE_ASSET_NAME = "MAN_inspection.exe"
 
+# --- Central (admin-controlled) email policy --------------------------------
+# Endpoints pull this JSON from the repo. The admin changes it in one place
+# (edit remote_policy.json on GitHub) and every machine follows on next refresh.
+# It contains NO secrets (recipient + schedule only).
+POLICY_URL = (
+    f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/main/"
+    "remote_policy.json"
+)
+POLICY_REFRESH_INTERVAL_SEC = 30 * 60   # re-pull the policy every 30 minutes
+
 # --- Behaviour tuning -------------------------------------------------------
 POLL_INTERVAL_SEC = 2.0          # how often we sample the foreground window
 IDLE_THRESHOLD_SEC = 60.0        # no keyboard/mouse for this long => "Idle"
@@ -32,4 +42,22 @@ def base_dir() -> str:
 def log_dir() -> str:
     d = os.path.join(base_dir(), "logs")
     os.makedirs(d, exist_ok=True)
+    return d
+
+
+def data_dir() -> str:
+    """Machine-wide folder for admin config, policy cache and state.
+
+    Prefers %PROGRAMDATA%\\MAN_inspection (so an admin can lock it down and
+    deploy it centrally); falls back to the folder beside the program.
+    """
+    program_data = os.environ.get("PROGRAMDATA")
+    if program_data:
+        d = os.path.join(program_data, "MAN_inspection")
+    else:
+        d = base_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        d = base_dir()
     return d

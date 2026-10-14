@@ -32,13 +32,18 @@ jobs:
         shell: bash
         run: echo "version=$(python -c "import activity_logger; print(activity_logger.__version__)")" >> "$GITHUB_OUTPUT"
 
-      - name: Build exe
+      - name: Build logger exe (for employee machines)
         run: pyinstaller --onefile --noconsole --name MAN_inspection main.py
+
+      - name: Build admin console exe (admin only)
+        run: pyinstaller --onefile --noconsole --name MAN_inspection_admin admin.py
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           name: MAN_inspection v${{ steps.ver.outputs.version }}
-          files: dist/MAN_inspection.exe
+          files: |
+            dist/MAN_inspection.exe
+            dist/MAN_inspection_admin.exe
           fail_on_unmatched_files: true

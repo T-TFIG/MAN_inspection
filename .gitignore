@@ -15,3 +15,14 @@ logs/
 
 # Update staging
 *.exe.new
+
+# Real email credentials must NEVER be committed (repo is public).
+# Only email_config.example.json is tracked.
+email_config.json
+
+# Runtime state written next to the program in dev (lives in ProgramData when built)
+policy_cache.json
+email_state.json
+
+# Admin console's saved GitHub token — never commit
+admin_settings.json

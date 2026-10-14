@@ -22,17 +22,24 @@ def _make_icon_image() -> Image.Image:
 
 
 class Tray:
-    def __init__(self, on_quit):
+    def __init__(self, on_quit, on_send_now=None):
         self._on_quit = on_quit
+        self._on_send_now = on_send_now
         self._icon = pystray.Icon(
             "MAN_inspection",
             icon=_make_icon_image(),
             title=f"MAN_inspection v{__version__}",
             menu=pystray.Menu(
+                pystray.MenuItem("Send today's log now", self._send_now),
                 pystray.MenuItem("Open logs folder", self._open_logs),
                 pystray.MenuItem("Quit", self._quit),
             ),
         )
+
+    def _send_now(self, icon, item):
+        if self._on_send_now:
+            # Run off the tray thread so SMTP latency never freezes the menu.
+            threading.Thread(target=self._on_send_now, daemon=True).start()
 
     def _open_logs(self, icon, item):
         try:
@@ -43,6 +50,12 @@ class Tray:
     def _quit(self, icon, item):
         self._icon.stop()
         self._on_quit()
+
+    def notify(self, message: str, title: str = "MAN_inspection") -> None:
+        try:
+            self._icon.notify(message, title)
+        except Exception:
+            pass
 
     def run(self) -> None:
         # Blocks on the calling thread until .stop() is called.
