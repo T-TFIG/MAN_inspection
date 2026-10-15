@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *  # noqa: F403  (LEFT/RIGHT/X/BOTH/... constants)
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
 from . import __version__, config, data_backend, updater
 from .central import DEFAULT_POLICY
@@ -272,8 +272,9 @@ class AdminConsole(ttk.Window):
         btns.pack(fill=X, pady=(0, 6))
         ttk.Button(btns, text="Refresh now", bootstyle=PRIMARY,
                   command=self._refresh_dashboard).pack(side=LEFT, padx=(0, 6))
-        ttk.Button(btns, text="Request log now", bootstyle=WARNING,
-                  command=self._request_log_now).pack(side=LEFT, padx=(0, 6))
+        self.btn_request_log = ttk.Button(btns, text="Request log now", bootstyle=WARNING,
+                                          command=self._request_log_now)
+        self.btn_request_log.pack(side=LEFT, padx=(0, 6))
         ttk.Button(btns, text="View logs for selected…", bootstyle=SECONDARY,
                   command=self._open_logs_for_selected).pack(side=LEFT)
 
@@ -359,6 +360,17 @@ class AdminConsole(ttk.Window):
             row=0, column=0, columnspan=2, sticky="w", **pad)
         self.upload_sched = ScheduleFields(upl, row=1, pad=pad)
 
+        ond = ttk.Labelframe(tab, text="On-demand requests  —  the Dashboard's "
+                             "\"Request log now\" button", bootstyle=WARNING, padding=10)
+        ond.pack(fill="x", pady=(0, 10))
+        self.var_on_demand_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ond, text="Enable on-demand requests",
+                        variable=self.var_on_demand_enabled,
+                        bootstyle="round-toggle").pack(anchor=W, padx=8, pady=(3, 0))
+        ttk.Label(ond, text="Turn off to stop every machine from reacting to "
+                 "\"Request log now\" (e.g. after too many were sent).",
+                 bootstyle=SECONDARY, wraplength=820).pack(anchor=W, padx=8, pady=(2, 3))
+
         eml = ttk.Labelframe(tab, text="Email  —  optional, in addition to upload",
                              bootstyle=SECONDARY, padding=10)
         eml.pack(fill="x", pady=(0, 10))
@@ -441,6 +453,13 @@ class AdminConsole(ttk.Window):
                          daemon=True).start()
 
     def _request_log_now(self) -> None:
+        if not self.var_on_demand_enabled.get():
+            messagebox.showwarning(
+                "On-demand requests are disabled",
+                "Turn on \"Enable on-demand requests\" in the Policy tab and "
+                "Save & Publish first.",
+            )
+            return
         sel = self.tree.selection()
         if not sel:
             messagebox.showinfo("Select a machine", "Select a row in the table first.")
@@ -566,22 +585,57 @@ class AdminConsole(ttk.Window):
             lb.insert("end", n)
         lb.pack(fill="both", expand=True, padx=10, pady=10)
 
-        def do_open():
+        def selected_name():
             sel = lb.curselection()
-            if not sel:
+            return names[sel[0]] if sel else None
+
+        def do_open():
+            name = selected_name()
+            if not name:
                 return
-            name = names[sel[0]]
             threading.Thread(target=self._download_and_open, args=(token, mid, name),
                              daemon=True).start()
 
-        ttk.Button(win, text="Download & open", bootstyle=PRIMARY,
-                  command=do_open).pack(pady=(0, 10))
+        def do_download():
+            name = selected_name()
+            if not name:
+                return
+            dest = filedialog.asksaveasfilename(
+                parent=win, title="Save log as", initialfile=name,
+                defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+            )
+            if not dest:
+                return
+            threading.Thread(target=self._download_only, args=(token, mid, name, dest),
+                             daemon=True).start()
+
+        btn_row = ttk.Frame(win)
+        btn_row.pack(pady=(0, 10))
+        ttk.Button(btn_row, text="Download & open", bootstyle=PRIMARY,
+                  command=do_open).pack(side=LEFT, padx=(0, 6))
+        ttk.Button(btn_row, text="Download…", bootstyle=(SECONDARY, OUTLINE),
+                  command=do_download).pack(side=LEFT)
+
+    def _fetch_log_bytes(self, token: str, mid: str, name: str) -> bytes:
+        raw, _ = data_backend.get_file(token, f"logs/{mid}/{name}")
+        if raw is None:
+            raise RuntimeError("file no longer exists")
+        return raw
+
+    def _download_only(self, token: str, mid: str, name: str, dest: str) -> None:
+        try:
+            raw = self._fetch_log_bytes(token, mid, name)
+            with open(dest, "wb") as fh:
+                fh.write(raw)
+        except Exception as exc:
+            self._ui_queue.put(lambda: messagebox.showerror("Download failed", str(exc)))
+            return
+        self._ui_queue.put(lambda: self._status(f"Saved to {dest}"))
 
     def _download_and_open(self, token: str, mid: str, name: str) -> None:
         try:
-            raw, _ = data_backend.get_file(token, f"logs/{mid}/{name}")
-            if raw is None:
-                raise RuntimeError("file no longer exists")
+            raw = self._fetch_log_bytes(token, mid, name)
             fd, path = tempfile.mkstemp(suffix=f"_{name}")
             with os.fdopen(fd, "wb") as fh:
                 fh.write(raw)
@@ -629,11 +683,19 @@ class AdminConsole(ttk.Window):
         self.var_upload_enabled.set(bool(policy["upload"].get("enabled", False)))
         self.upload_sched.set(policy["upload"])
 
+        self.var_on_demand_enabled.set(bool(policy.get("on_demand", {}).get("enabled", True)))
+        self._update_request_button_state()
+
         self.var_email_enabled.set(bool(policy["email"].get("enabled", False)))
         self.var_recipient.set(policy["email"].get("recipient_email", ""))
         self.email_sched.set(policy["email"])
 
         self._status("Loaded current policy.")
+
+    def _update_request_button_state(self) -> None:
+        """Reflects the PUBLISHED on_demand.enabled value, not unsaved edits."""
+        enabled = self.var_on_demand_enabled.get()
+        self.btn_request_log.configure(state="normal" if enabled else "disabled")
 
     # -- policy: save --
     def _collect_policy(self) -> dict | None:
@@ -657,6 +719,7 @@ class AdminConsole(ttk.Window):
             },
             "heartbeat_interval_sec": int(self.var_heartbeat.get()) * 60,
             "upload": {"enabled": self.var_upload_enabled.get(), **upload_sched},
+            "on_demand": {"enabled": self.var_on_demand_enabled.get()},
             "email": {
                 "enabled": self.var_email_enabled.get(),
                 "recipient_email": self.var_recipient.get().strip(),
@@ -684,6 +747,7 @@ class AdminConsole(ttk.Window):
             self._ui_queue.put(lambda: self._status(f"Publish failed: {exc}"))
             return
         self._sha = new_sha
+        self._ui_queue.put(self._update_request_button_state)
         self._ui_queue.put(lambda: self._status(
             "Published. Machines will apply it within a few minutes."))
 

@@ -97,12 +97,19 @@ DEFAULT_POLICY = {
         "day_of_week": "mon",
         "day_of_month": 1,
     },
+    # Master switch for the admin's "Request log now" feature. Off by
+    # default-safe choice would be True (keeps existing behavior); admins can
+    # flip it off to stop machines from reacting to on-demand requests at all
+    # — e.g. if a flurry of clicks produced more uploads than wanted.
+    "on_demand": {
+        "enabled": True,
+    },
 }
 
 
 def _merge_policy(data: dict) -> dict:
     merged = json.loads(json.dumps(DEFAULT_POLICY))  # deep copy
-    for key in ("monitoring", "upload", "email"):
+    for key in ("monitoring", "upload", "email", "on_demand"):
         if isinstance(data.get(key), dict):
             merged[key].update(data[key])
     if "heartbeat_interval_sec" in data:
@@ -214,6 +221,8 @@ class CentralSync(threading.Thread):
         self._settings.apply_monitoring(policy["monitoring"])
         self._settings.heartbeat_interval_sec = float(
             policy.get("heartbeat_interval_sec", self._settings.heartbeat_interval_sec))
+        self._settings.on_demand_requests_enabled = bool(
+            policy.get("on_demand", {}).get("enabled", True))
 
         send_heartbeat()
         self._maybe_upload(policy["upload"])
@@ -246,8 +255,9 @@ class RequestWatcher(threading.Thread):
     debugging a machine doesn't have to wait out the full heartbeat interval.
     """
 
-    def __init__(self, notify=None):
+    def __init__(self, settings, notify=None):
         super().__init__(name="RequestWatcher", daemon=True)
+        self._settings = settings
         self._notify = notify
         self._stop = threading.Event()
         self._etag: str | None = None
@@ -259,6 +269,10 @@ class RequestWatcher(threading.Thread):
         if not is_configured():
             return
         while not self._stop.wait(config.REQUEST_POLL_INTERVAL_SEC):
+            if not self._settings.on_demand_requests_enabled:
+                # Disabled by policy: skip the check entirely (no API call at
+                # all, not even a conditional one) until it's turned back on.
+                continue
             try:
                 self._check_once()
             except Exception:

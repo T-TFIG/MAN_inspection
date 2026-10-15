@@ -22,6 +22,10 @@ class RuntimeSettings:
     track_usb: bool = True
     track_session: bool = True
     heartbeat_interval_sec: float = config.HEARTBEAT_INTERVAL_SEC_DEFAULT
+    # Master switch for the admin's "Request log now" — RequestWatcher reads
+    # this (set by CentralSync from policy.json) instead of fetching policy
+    # itself every 15s, so toggling it costs no extra API calls.
+    on_demand_requests_enabled: bool = True
 
     def apply_monitoring(self, monitoring: dict) -> None:
         self.poll_interval_sec = float(
