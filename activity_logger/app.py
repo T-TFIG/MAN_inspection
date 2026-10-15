@@ -25,10 +25,16 @@ class App:
         self._tray = Tray(on_quit=self.stop, on_send_now=self._send_now,
                           on_upload_now=self._upload_now,
                           on_check_updates=self._check_updates)
-        self._email_scheduler = EmailScheduler(notify=self._on_email_result)
-        self._central_sync = central.CentralSync(self._settings,
-                                                 notify=self._on_upload_result)
-        self._request_watcher = central.RequestWatcher(notify=self._on_upload_result)
+        # Background/automatic sends (scheduled upload, scheduled email, and
+        # an admin's on-demand "Request log now") stay silent — popping a
+        # toast for something the employee didn't trigger is just noise, and
+        # the visible tray icon is already the transparency signal. Only a
+        # tray menu click the employee made themselves (_upload_now,
+        # _send_now, _check_updates below) shows a notification, since that's
+        # feedback for their own action.
+        self._email_scheduler = EmailScheduler(notify=None)
+        self._central_sync = central.CentralSync(self._settings, notify=None)
+        self._request_watcher = central.RequestWatcher(notify=None)
         self._stopping = threading.Event()
 
     def start(self) -> None:
