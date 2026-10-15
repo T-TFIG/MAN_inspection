@@ -14,6 +14,10 @@ Everything here talks to the private "T-TFIG/MAN_inspection-data" repo only
 (see activity_logger/config.py), using a GitHub token the admin pastes in
 once. That token needs Contents: Read/write on that ONE repo — nothing else,
 and never the public source-code repo.
+
+UI note: built on ttkbootstrap (a themed drop-in replacement for tkinter.ttk)
+purely for a nicer, modern look — every widget here is API-compatible with
+plain ttk, so the business logic below is unaffected by the theming.
 """
 
 import json
@@ -23,13 +27,17 @@ import tempfile
 import threading
 import tkinter as tk
 from datetime import datetime, timezone
-from tkinter import messagebox, ttk
+
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *  # noqa: F403  (LEFT/RIGHT/X/BOTH/... constants)
+from tkinter import messagebox
 
 from . import __version__, config, data_backend, updater
 from .central import DEFAULT_POLICY
 
 _WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 ONLINE_WITHIN_SEC = 15 * 60  # heartbeat default is 5 min; allow for a couple misses
+_THEME = "bootstrap-light"
 
 
 # --- local admin settings (token) -------------------------------------------
@@ -156,12 +164,46 @@ class ScheduleFields:
         self._refresh()
 
 
+class ScrollableFrame(ttk.Frame):
+    """A vertically-scrolling container — keeps content reachable at any
+    window size instead of letting the bottom of a tall tab get clipped."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        canvas = tk.Canvas(self, highlightthickness=0,
+                           background=self.winfo_toplevel().style.colors.bg)
+        vsb = ttk.Scrollbar(self, orient=VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        vsb.pack(side=RIGHT, fill=Y)
+
+        self.body = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=self.body, anchor="nw")
+
+        def _sync_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_width(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        self.body.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _sync_width)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+
 # --- GUI --------------------------------------------------------------------
 
 
-class AdminConsole(tk.Tk):
+class AdminConsole(ttk.Window):
     def __init__(self):
-        super().__init__()
+        super().__init__(title=f"MAN_inspection — Admin Console v{__version__}",
+                         theme=_THEME, size=(980, 820), minsize=(860, 700),
+                         resizable=(True, True))
         # Workaround for a Tk/Windows bug: on non-English system locales (e.g.
         # Thai, cp874) Tcl can decode clipboard paste using the OS ANSI
         # codepage instead of UTF-8, silently corrupting pasted ASCII secrets
@@ -172,8 +214,6 @@ class AdminConsole(tk.Tk):
         except Exception:
             pass
 
-        self.title(f"MAN_inspection — Admin Console v{__version__}")
-        self.geometry("720x520")
         self._sha = None
         self._machines: dict[str, dict] = {}
 
@@ -184,6 +224,7 @@ class AdminConsole(tk.Tk):
 
         self.var_token = tk.StringVar(value=load_token())
         self.var_status = tk.StringVar(value="Ready")
+        self.var_summary = tk.StringVar(value="")
 
         self._build()
         if self.var_token.get().strip():
@@ -194,48 +235,74 @@ class AdminConsole(tk.Tk):
     def _build(self) -> None:
         pad = {"padx": 8, "pady": 4}
 
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=10, pady=(10, 0))
-        ttk.Label(top, text=f"Data repo: {config.DATA_REPO_OWNER}/{config.DATA_REPO_NAME}"
-                  ).grid(row=0, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Label(top, text="Access token:").grid(row=1, column=0, sticky="e", **pad)
-        ttk.Entry(top, textvariable=self.var_token, width=36, show="*").grid(
-            row=1, column=1, sticky="w", **pad)
-        ttk.Button(top, text="Paste", width=6, command=self._paste_token).grid(
-            row=1, column=2, sticky="w")
+        header = ttk.Frame(self, padding=(16, 14, 16, 6))
+        header.pack(fill=X)
+        title_row = ttk.Frame(header)
+        title_row.pack(fill=X)
+        ttk.Label(title_row, text="MAN_inspection", font=("Segoe UI", 16, "bold")
+                  ).pack(side=LEFT)
+        ttk.Label(title_row, text="  Admin Console", font=("Segoe UI", 16),
+                  bootstyle=SECONDARY).pack(side=LEFT)
+        ttk.Label(header, text=f"repo: {config.DATA_REPO_OWNER}/{config.DATA_REPO_NAME}",
+                  bootstyle=SECONDARY, font=("Segoe UI", 9)).pack(anchor=W, pady=(2, 0))
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=10, pady=10)
+        token_bar = ttk.Frame(self, padding=(16, 0, 16, 10))
+        token_bar.pack(fill=X)
+        ttk.Label(token_bar, text="Access token:").pack(side=LEFT, padx=(0, 6))
+        ttk.Entry(token_bar, textvariable=self.var_token, show="*").pack(
+            side=LEFT, fill=X, expand=True, padx=(0, 6))
+        ttk.Button(token_bar, text="Paste", bootstyle=(SECONDARY, OUTLINE),
+                  width=8, command=self._paste_token).pack(side=LEFT)
+
+        nb = ttk.Notebook(self, padding=(12, 8))
+        nb.pack(fill=BOTH, expand=True, padx=12)
         self._build_dashboard_tab(nb)
         self._build_policy_tab(nb)
 
-        ttk.Label(self, textvariable=self.var_status, relief="sunken",
-                  anchor="w").pack(fill="x", padx=10, pady=(0, 10))
+        status_bar = ttk.Frame(self, bootstyle=SECONDARY)
+        status_bar.pack(fill=X, side=BOTTOM)
+        ttk.Label(status_bar, textvariable=self.var_status, bootstyle=(INVERSE, SECONDARY),
+                  anchor=W, padding=(10, 6)).pack(fill=X)
 
     def _build_dashboard_tab(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb)
-        nb.add(tab, text="Dashboard")
+        tab = ttk.Frame(nb, padding=10)
+        nb.add(tab, text="  Dashboard  ")
 
         btns = ttk.Frame(tab)
-        btns.pack(fill="x", pady=(6, 4))
-        ttk.Button(btns, text="Refresh now", command=self._refresh_dashboard).pack(
-            side="left", padx=4)
-        ttk.Button(btns, text="Request log now",
-                  command=self._request_log_now).pack(side="left", padx=4)
-        ttk.Button(btns, text="View logs for selected…",
-                  command=self._open_logs_for_selected).pack(side="left", padx=4)
+        btns.pack(fill=X, pady=(0, 6))
+        ttk.Button(btns, text="Refresh now", bootstyle=PRIMARY,
+                  command=self._refresh_dashboard).pack(side=LEFT, padx=(0, 6))
+        ttk.Button(btns, text="Request log now", bootstyle=WARNING,
+                  command=self._request_log_now).pack(side=LEFT, padx=(0, 6))
+        ttk.Button(btns, text="View logs for selected…", bootstyle=SECONDARY,
+                  command=self._open_logs_for_selected).pack(side=LEFT)
+
+        ttk.Label(tab, textvariable=self.var_summary, bootstyle=SECONDARY,
+                  font=("Segoe UI", 10)).pack(anchor=W, pady=(0, 6))
+
+        table_frame = ttk.Frame(tab)
+        table_frame.pack(fill=BOTH, expand=True)
 
         cols = ("hostname", "machine_id", "version", "status", "last_seen")
-        self.tree = ttk.Treeview(tab, columns=cols, show="headings", height=14)
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings",
+                                 height=16, bootstyle=PRIMARY)
         headings = {"hostname": "Hostname", "machine_id": "Machine ID",
                     "version": "Version", "status": "Status",
                     "last_seen": "Last seen"}
-        widths = {"hostname": 150, "machine_id": 100, "version": 170,
-                  "status": 70, "last_seen": 100}
+        widths = {"hostname": 160, "machine_id": 100, "version": 190,
+                  "status": 80, "last_seen": 100}
         for c in cols:
             self.tree.heading(c, text=headings[c])
             self.tree.column(c, width=widths[c], anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=4, pady=4)
+
+        vsb = ttk.Scrollbar(table_frame, orient=VERTICAL, command=self.tree.yview,
+                            bootstyle=ROUND)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
         self.tree.tag_configure("online", foreground="#1a7f37")
         self.tree.tag_configure("offline", foreground="#8a8f98")
         self.tree.tag_configure("outdated", foreground="#b35900")
@@ -244,24 +311,28 @@ class AdminConsole(tk.Tk):
         self.after(60_000, self._auto_refresh)
 
     def _build_policy_tab(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb)
-        nb.add(tab, text="Policy")
+        outer = ttk.Frame(nb, padding=10)
+        nb.add(outer, text="  Policy  ")
+        scroller = ScrollableFrame(outer)
+        scroller.pack(fill=BOTH, expand=True)
+        tab = scroller.body
         pad = {"padx": 8, "pady": 3}
 
-        mon = ttk.LabelFrame(tab, text="Monitoring (what gets logged, on every machine)")
-        mon.pack(fill="x", padx=4, pady=6)
+        mon = ttk.Labelframe(tab, text="Monitoring  —  what gets logged, on every machine",
+                             bootstyle=INFO, padding=10)
+        mon.pack(fill="x", pady=(0, 10))
         self.var_track_window = tk.BooleanVar(value=True)
         self.var_track_idle = tk.BooleanVar(value=True)
         self.var_track_usb = tk.BooleanVar(value=True)
         self.var_track_session = tk.BooleanVar(value=True)
-        ttk.Checkbutton(mon, text="Track active window", variable=self.var_track_window
-                        ).grid(row=0, column=0, sticky="w", **pad)
-        ttk.Checkbutton(mon, text="Track idle/active", variable=self.var_track_idle
-                        ).grid(row=0, column=1, sticky="w", **pad)
-        ttk.Checkbutton(mon, text="Track USB", variable=self.var_track_usb
-                        ).grid(row=1, column=0, sticky="w", **pad)
-        ttk.Checkbutton(mon, text="Track lock/logon", variable=self.var_track_session
-                        ).grid(row=1, column=1, sticky="w", **pad)
+        ttk.Checkbutton(mon, text="Track active window", variable=self.var_track_window,
+                        bootstyle="round-toggle").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Checkbutton(mon, text="Track idle/active", variable=self.var_track_idle,
+                        bootstyle="round-toggle").grid(row=0, column=1, sticky="w", **pad)
+        ttk.Checkbutton(mon, text="Track USB", variable=self.var_track_usb,
+                        bootstyle="round-toggle").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Checkbutton(mon, text="Track lock/logon", variable=self.var_track_session,
+                        bootstyle="round-toggle").grid(row=1, column=1, sticky="w", **pad)
 
         self.var_poll = tk.DoubleVar(value=2.0)
         self.var_idle_threshold = tk.IntVar(value=60)
@@ -274,35 +345,38 @@ class AdminConsole(tk.Tk):
                                                           sticky="e", **pad)
         ttk.Spinbox(mon, textvariable=self.var_idle_threshold, from_=10, to=3600,
                    width=8).grid(row=3, column=1, sticky="w", **pad)
-        ttk.Label(mon, text="Heartbeat interval (min):").grid(row=3, column=2,
+        ttk.Label(mon, text="Heartbeat interval (min):").grid(row=4, column=0,
                                                               sticky="e", **pad)
         ttk.Spinbox(mon, textvariable=self.var_heartbeat, from_=1, to=120,
-                   width=8).grid(row=3, column=3, sticky="w", **pad)
+                   width=8).grid(row=4, column=1, sticky="w", **pad)
 
-        upl = ttk.LabelFrame(tab, text="Central upload (default transport — no email needed)")
-        upl.pack(fill="x", padx=4, pady=6)
+        upl = ttk.Labelframe(tab, text="Central upload  —  default transport, no email needed",
+                             bootstyle=SUCCESS, padding=10)
+        upl.pack(fill="x", pady=(0, 10))
         self.var_upload_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(upl, text="Enable central upload", variable=self.var_upload_enabled
-                        ).grid(row=0, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(upl, text="Enable central upload", variable=self.var_upload_enabled,
+                        bootstyle="round-toggle").grid(
+            row=0, column=0, columnspan=2, sticky="w", **pad)
         self.upload_sched = ScheduleFields(upl, row=1, pad=pad)
 
-        eml = ttk.LabelFrame(tab, text="Email (optional, in addition to upload)")
-        eml.pack(fill="x", padx=4, pady=6)
+        eml = ttk.Labelframe(tab, text="Email  —  optional, in addition to upload",
+                             bootstyle=SECONDARY, padding=10)
+        eml.pack(fill="x", pady=(0, 10))
         self.var_email_enabled = tk.BooleanVar(value=False)
         self.var_recipient = tk.StringVar()
-        ttk.Checkbutton(eml, text="Enable email", variable=self.var_email_enabled
-                        ).grid(row=0, column=0, sticky="w", **pad)
+        ttk.Checkbutton(eml, text="Enable email", variable=self.var_email_enabled,
+                        bootstyle="round-toggle").grid(row=0, column=0, sticky="w", **pad)
         ttk.Label(eml, text="Recipient:").grid(row=0, column=1, sticky="e", **pad)
         ttk.Entry(eml, textvariable=self.var_recipient, width=28).grid(
             row=0, column=2, columnspan=2, sticky="w", **pad)
         self.email_sched = ScheduleFields(eml, row=1, pad=pad)
 
         btns = ttk.Frame(tab)
-        btns.pack(fill="x", pady=8)
-        ttk.Button(btns, text="Load current", command=self._load_policy).pack(
-            side="left", padx=4)
-        ttk.Button(btns, text="Save & Publish", command=self._save_policy).pack(
-            side="left", padx=4)
+        btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(btns, text="Load current", bootstyle=SECONDARY,
+                  command=self._load_policy).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="Save & Publish", bootstyle=SUCCESS,
+                  command=self._save_policy).pack(side="left")
 
     # -- status / ui queue --
     def _status(self, msg: str) -> None:
@@ -426,10 +500,13 @@ class AdminConsole(tk.Tk):
     def _apply_dashboard(self, machines: dict, latest=None) -> None:
         self._machines = machines
         self.tree.delete(*self.tree.get_children())
+        online_count = 0
+        outdated_count = 0
         for mid, m in sorted(machines.items(),
                              key=lambda kv: kv[1].get("hostname", "")):
             last_seen = m.get("last_seen", "")
             online = _is_online(last_seen)
+            online_count += 1 if online else 0
             version_text = m.get("app_version", "?")
             is_outdated = False
             if latest is not None:
@@ -437,6 +514,7 @@ class AdminConsole(tk.Tk):
                 if current is not None and current < latest:
                     version_text = f"{version_text} (v{latest} available)"
                     is_outdated = True
+                    outdated_count += 1
             # One tag per row (not stacked) — avoids relying on Tk's tag
             # priority rules, which are easy to get backwards.
             tag = "outdated" if is_outdated else ("online" if online else "offline")
@@ -446,6 +524,10 @@ class AdminConsole(tk.Tk):
                        "Online" if online else "Offline", _relative_time(last_seen)),
                 tags=(tag,),
             )
+        self.var_summary.set(
+            f"{len(machines)} machine(s)  ·  {online_count} online  ·  "
+            f"{outdated_count} outdated"
+        )
         suffix = f" — latest release is v{latest}" if latest is not None else ""
         self._status(f"Dashboard updated — {len(machines)} machine(s) known.{suffix}")
 
@@ -473,17 +555,16 @@ class AdminConsole(tk.Tk):
 
     def _show_log_picker(self, token: str, mid: str, names: list[str]) -> None:
         self._status("Ready")
-        win = tk.Toplevel(self)
-        win.title(f"Logs for {mid}")
-        win.geometry("360x320")
+        win = ttk.Toplevel(title=f"Logs for {mid}")
+        win.geometry("380x340")
         if not names:
-            ttk.Label(win, text="No uploaded logs for this machine yet.").pack(
-                padx=12, pady=12)
+            ttk.Label(win, text="No uploaded logs for this machine yet.",
+                     padding=16).pack()
             return
-        lb = tk.Listbox(win)
+        lb = tk.Listbox(win, relief="flat", borderwidth=0, highlightthickness=1)
         for n in names:
             lb.insert("end", n)
-        lb.pack(fill="both", expand=True, padx=8, pady=8)
+        lb.pack(fill="both", expand=True, padx=10, pady=10)
 
         def do_open():
             sel = lb.curselection()
@@ -493,7 +574,8 @@ class AdminConsole(tk.Tk):
             threading.Thread(target=self._download_and_open, args=(token, mid, name),
                              daemon=True).start()
 
-        ttk.Button(win, text="Download & open", command=do_open).pack(pady=(0, 8))
+        ttk.Button(win, text="Download & open", bootstyle=PRIMARY,
+                  command=do_open).pack(pady=(0, 10))
 
     def _download_and_open(self, token: str, mid: str, name: str) -> None:
         try:

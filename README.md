@@ -76,6 +76,8 @@ build.bat
 
 ## Admin Console — dashboard + ตั้งค่าส่วนกลาง
 
+หน้าตาใช้ธีม modern flat (ttkbootstrap) ปรับขนาดหน้าต่างได้ แท็บ Policy เลื่อน scroll ได้ถ้าเนื้อหายาวกว่าจอ
+
 เปิด `MAN_inspection_admin.exe` จะเจอ 2 แท็บ:
 
 ### แท็บ Dashboard
