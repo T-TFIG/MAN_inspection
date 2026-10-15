@@ -4,4 +4,4 @@ Keep this module lightweight: it is imported in CI just to read the version,
 so it must not pull in Windows-only dependencies at import time.
 """
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
