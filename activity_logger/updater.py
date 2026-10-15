@@ -87,6 +87,34 @@ def check_and_update() -> bool:
     return True
 
 
+def check_now() -> tuple[bool, str]:
+    """Manual, user-triggered check (e.g. the tray's "Check for updates").
+
+    Unlike check_and_update(), this always returns a human-readable reason,
+    including "already up to date" and "couldn't reach GitHub" — the silent
+    periodic check doesn't need that, but a button someone just clicked does.
+    """
+    latest = _latest_release()
+    if not latest:
+        return False, "Could not reach GitHub to check for updates."
+    version, download_url = latest
+
+    try:
+        current = Version(__version__)
+    except InvalidVersion:
+        current = None
+    if current is not None and version <= current:
+        return False, f"Up to date (v{__version__})."
+    if not _is_frozen():
+        return False, f"Update v{version} is available (not applied in a dev run)."
+    if not download_url:
+        return False, f"Update v{version} found, but it has no download asset."
+
+    if check_and_update():
+        return True, f"Updating to v{version} — the app will restart shortly."
+    return False, f"Update v{version} found, but the download failed. Try again later."
+
+
 def _spawn_swapper(pid: int, new_path: str, cur_path: str) -> None:
     batch = (
         "@echo off\r\n"

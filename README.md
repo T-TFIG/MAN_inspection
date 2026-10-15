@@ -168,6 +168,45 @@ token นี้เก็บไว้ในเครื่อง admin เท่�
 
 โปรแกรมออกแบบให้ **โปร่งใส**: มีไอคอน tray ให้เห็นว่ากำลังทำงาน และไม่เก็บการพิมพ์คีย์บอร์ดหรือภาพหน้าจอ
 
-## ให้โปรแกรมรันตอนเปิดเครื่อง (ไม่บังคับ)
+## ให้โปรแกรมรันตอนเปิดเครื่อง
+
+### วิธีแนะนำสำหรับ deploy หลายเครื่อง: Scheduled Task (สคริปต์เดียว)
+
+[deploy/install.ps1](deploy/install.ps1) ทำให้ครบในคำสั่งเดียว: โหลด `.exe` เวอร์ชันล่าสุดจาก Release
+มาติดตั้งที่ `C:\ProgramData\MAN_inspection\app\` แล้วตั้ง **Scheduled Task** ให้รันตอน login ของ
+**ผู้ใช้คนไหนก็ได้** (ไม่ต้องสิทธิ์ admin ตอนรัน, ไม่ติด time limit 72 ชม.แบบ default, restart ให้เองถ้า crash)
+
+รันบนเครื่องพนักงาน (เปิด PowerShell **แบบ Run as Administrator**):
+
+```powershell
+irm https://raw.githubusercontent.com/T-TFIG/MAN_inspection/main/deploy/install.ps1 | iex
+```
+
+หรือถ้ามี `.exe` อยู่แล้ว ไม่อยากให้โหลดใหม่:
+```powershell
+.\install.ps1 -ExePath C:\Downloads\MAN_inspection.exe
+```
+
+ดัน script นี้ผ่าน GPO startup script / Intune / PDQ Deploy ก็ได้เหมือนกัน (เป็น PowerShell ธรรมดา)
+
+ถอนการติดตั้ง: [deploy/uninstall.ps1](deploy/uninstall.ps1) (ลบ Scheduled Task + ตัว `.exe`, ไม่ลบ log/config)
+
+### วิธีง่ายสำหรับเครื่องเดียว: Startup folder
 
 กด `Win + R` → พิมพ์ `shell:startup` → วาง shortcut ของ `MAN_inspection.exe` ไว้ในโฟลเดอร์นั้น
+
+## เช็กว่าแต่ละเครื่อง up-to-date รึยัง
+
+### จาก Admin Console (เห็นทุกเครื่องพร้อมกัน)
+
+แท็บ **Dashboard** จะเทียบเวอร์ชันของทุกเครื่องกับ Release ล่าสุดบน GitHub ให้อัตโนมัติทุกครั้งที่รีเฟรช —
+เครื่องที่ล้าหลังจะโชว์เป็น**สีส้ม** พร้อมข้อความ เช่น `0.2.0 (v0.3.2 available)` ในคอลัมน์ Version
+(เครื่องที่เป็นเวอร์ชันล่าสุดอยู่แล้วจะโชว์ปกติ ไม่มีข้อความเตือน)
+
+### จากเครื่องพนักงานเอง
+
+คลิกขวาไอคอน tray → **Check for updates** จะเด้ง notification บอกทันที:
+- `Up to date (v0.3.2).` — ล่าสุดอยู่แล้ว
+- `Updating to v0.3.3 — the app will restart shortly.` — เจอเวอร์ชันใหม่ กำลังอัปเดตให้ (จะปิด-เปิดใหม่เอง)
+
+> ปกติ `.exe` เช็กอัปเดตให้เองอยู่แล้วตอนเปิดโปรแกรม + ทุก 6 ชั่วโมง ปุ่มนี้มีไว้เผื่ออยากเช็กทันทีไม่ต้องรอ

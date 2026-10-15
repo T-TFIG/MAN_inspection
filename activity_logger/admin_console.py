@@ -25,7 +25,7 @@ import tkinter as tk
 from datetime import datetime, timezone
 from tkinter import messagebox, ttk
 
-from . import __version__, config, data_backend
+from . import __version__, config, data_backend, updater
 from .central import DEFAULT_POLICY
 
 _WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -230,14 +230,15 @@ class AdminConsole(tk.Tk):
         headings = {"hostname": "Hostname", "machine_id": "Machine ID",
                     "version": "Version", "status": "Status",
                     "last_seen": "Last seen"}
-        widths = {"hostname": 160, "machine_id": 110, "version": 70,
-                  "status": 80, "last_seen": 110}
+        widths = {"hostname": 150, "machine_id": 100, "version": 170,
+                  "status": 70, "last_seen": 100}
         for c in cols:
             self.tree.heading(c, text=headings[c])
             self.tree.column(c, width=widths[c], anchor="w")
         self.tree.pack(fill="both", expand=True, padx=4, pady=4)
         self.tree.tag_configure("online", foreground="#1a7f37")
         self.tree.tag_configure("offline", foreground="#8a8f98")
+        self.tree.tag_configure("outdated", foreground="#b35900")
 
         # Auto-refresh every 60s.
         self.after(60_000, self._auto_refresh)
@@ -409,22 +410,44 @@ class AdminConsole(tk.Tk):
         except Exception as exc:
             self._ui_queue.put(lambda: self._status(f"Dashboard refresh failed: {exc}"))
             return
-        self._ui_queue.put(lambda: self._apply_dashboard(machines))
 
-    def _apply_dashboard(self, machines: dict) -> None:
+        # Public info, no token needed — best-effort, dashboard still works
+        # without it (version column just won't flag anything as outdated).
+        latest = None
+        try:
+            found = updater._latest_release()
+            if found:
+                latest = found[0]
+        except Exception:
+            pass
+
+        self._ui_queue.put(lambda: self._apply_dashboard(machines, latest))
+
+    def _apply_dashboard(self, machines: dict, latest=None) -> None:
         self._machines = machines
         self.tree.delete(*self.tree.get_children())
         for mid, m in sorted(machines.items(),
                              key=lambda kv: kv[1].get("hostname", "")):
             last_seen = m.get("last_seen", "")
             online = _is_online(last_seen)
+            version_text = m.get("app_version", "?")
+            is_outdated = False
+            if latest is not None:
+                current = updater._parse(version_text)
+                if current is not None and current < latest:
+                    version_text = f"{version_text} (v{latest} available)"
+                    is_outdated = True
+            # One tag per row (not stacked) — avoids relying on Tk's tag
+            # priority rules, which are easy to get backwards.
+            tag = "outdated" if is_outdated else ("online" if online else "offline")
             self.tree.insert(
                 "", "end", iid=mid,
-                values=(m.get("hostname", "?"), mid, m.get("app_version", "?"),
+                values=(m.get("hostname", "?"), mid, version_text,
                        "Online" if online else "Offline", _relative_time(last_seen)),
-                tags=("online" if online else "offline",),
+                tags=(tag,),
             )
-        self._status(f"Dashboard updated — {len(machines)} machine(s) known.")
+        suffix = f" — latest release is v{latest}" if latest is not None else ""
+        self._status(f"Dashboard updated — {len(machines)} machine(s) known.{suffix}")
 
     def _open_logs_for_selected(self) -> None:
         sel = self.tree.selection()

@@ -23,7 +23,8 @@ class App:
         self._poller = Poller(self._queue, self._settings)
         self._msgwin = MessageWindow(self._queue, self._settings)
         self._tray = Tray(on_quit=self.stop, on_send_now=self._send_now,
-                          on_upload_now=self._upload_now)
+                          on_upload_now=self._upload_now,
+                          on_check_updates=self._check_updates)
         self._email_scheduler = EmailScheduler(notify=self._on_email_result)
         self._central_sync = central.CentralSync(self._settings,
                                                  notify=self._on_upload_result)
@@ -78,6 +79,13 @@ class App:
     def _upload_now(self) -> None:
         ok, info = central.upload_logs([date.today()])
         self._on_upload_result(ok, info)
+
+    def _check_updates(self) -> None:
+        try:
+            _, info = updater.check_now()
+        except Exception as exc:
+            info = f"Update check failed: {exc}"
+        self._tray.notify(info)
 
     def _on_email_result(self, ok: bool, info: str) -> None:
         prefix = "Log emailed" if ok else "Email not sent"
