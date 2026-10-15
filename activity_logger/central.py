@@ -185,8 +185,13 @@ def upload_logs(dates: list, label: str = "") -> tuple[bool, str]:
             continue
         path = f"logs/{mid}/{os.path.basename(src)}"
         try:
-            data_backend.put_bytes(CLIENT_DATA_TOKEN, path, content,
-                                   f"upload log {os.path.basename(src)}")
+            # _retrying (not plain put_bytes): re-uploading the SAME day's
+            # file (e.g. a second "Request log now") must overwrite the
+            # existing one, which needs its current sha — this was silently
+            # failing every time before (422, no sha supplied) since nothing
+            # surfaced the error once background notifications went quiet.
+            data_backend.put_bytes_retrying(CLIENT_DATA_TOKEN, path, content,
+                                            f"upload log {os.path.basename(src)}")
             uploaded += 1
         except Exception as exc:
             return False, f"upload failed: {exc}"
@@ -293,17 +298,38 @@ class RequestWatcher(threading.Thread):
         except Exception:
             request = {}
 
-        # Always remove the request first so a slow/failed upload never makes
-        # it fire again on every poll afterwards.
-        try:
-            data_backend.delete_file(CLIENT_DATA_TOKEN, path, sha,
-                                     "request handled")
-        except Exception:
-            pass
-        self._etag = None  # the file is gone; forget the stale ETag
-
+        # We wrote this "done" status ourselves on a previous poll; our own
+        # write changed the ETag, which is why this poll saw "changed" again.
+        # Nothing new to do — just remember the new ETag and stop.
+        if request.get("status") == "done":
+            return
         if request.get("action") != "upload_now":
             return
-        ok, info = upload_logs([datetime.now().date()], label="on-demand request")
+
+        today = datetime.now().date()
+        ok, info = upload_logs([today], label="on-demand request")
+
+        if ok:
+            # Leave the request file in place but mark it done, so the Admin
+            # Console can show "ready" with the exact file name instead of
+            # the admin having to guess from a bare file listing. A fresh
+            # "Request log now" click overwrites this with a new pending
+            # request, replacing whatever was here before.
+            done_body = dict(request)
+            done_body.update({
+                "status": "done",
+                "completed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "file": os.path.basename(_path_for(today)),
+            })
+            try:
+                data_backend.put_json(CLIENT_DATA_TOKEN, path, done_body,
+                                      "request fulfilled", sha=sha)
+            except Exception:
+                pass
+        # Either way, force a plain (non-conditional) GET next poll: our own
+        # write above changed the file's ETag, and on failure we don't know
+        # the current ETag either.
+        self._etag = None
+
         if self._notify:
             self._notify(ok, info)

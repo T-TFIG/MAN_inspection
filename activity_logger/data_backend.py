@@ -90,6 +90,32 @@ def put_json(token: str, path: str, data: dict, message: str,
                      owner=owner, repo=repo)
 
 
+def put_bytes_retrying(token: str, path: str, content: bytes, message: str,
+                       *, owner: str = config.DATA_REPO_OWNER,
+                       repo: str = config.DATA_REPO_NAME,
+                       cached_sha: str | None = None, attempts: int = 3) -> str:
+    """put_bytes, but resolves the current sha first and retries on conflict.
+
+    Needed for any path that gets written more than once (e.g. the same
+    day's log, re-uploaded on a later request): GitHub's Contents API
+    requires the file's current sha to update an existing file and returns
+    422 (not 409) if it's simply missing — so, unlike put_json_retrying,
+    this always fetches the sha up front rather than only after a conflict.
+    """
+    sha = cached_sha
+    last_exc: Exception | None = None
+    for _ in range(attempts):
+        if sha is None:
+            _, sha = get_file(token, path, owner=owner, repo=repo)
+        try:
+            return put_bytes(token, path, content, message, sha, owner=owner, repo=repo)
+        except ConflictError as exc:
+            last_exc = exc
+            sha = None  # force a fresh fetch next loop
+            time.sleep(0.5)
+    raise last_exc or ConflictError(path)
+
+
 def put_json_retrying(token: str, path: str, data: dict, message: str,
                       *, owner: str = config.DATA_REPO_OWNER,
                       repo: str = config.DATA_REPO_NAME,
