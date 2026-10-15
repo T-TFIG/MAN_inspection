@@ -114,6 +114,42 @@ def put_json_retrying(token: str, path: str, data: dict, message: str,
     raise last_exc or ConflictError(path)
 
 
+def get_file_conditional(token: str, path: str, etag: str | None = None, *,
+                         owner: str = config.DATA_REPO_OWNER,
+                         repo: str = config.DATA_REPO_NAME):
+    """Cheap polling primitive: a conditional GET using If-None-Match.
+
+    Returns (changed, raw_bytes_or_None, sha_or_None, etag_or_None).
+    ``changed`` is False on a 304 (content identical to what ``etag`` names) —
+    GitHub does not count a 304 against the API rate limit, so this is safe to
+    call every few seconds even across many machines sharing one token.
+    Returns changed=True, raw=None on a 404 (file deleted/never existed).
+    """
+    headers = _headers(token)
+    if etag:
+        headers["If-None-Match"] = etag
+    resp = requests.get(f"{_api_base(owner, repo)}/contents/{path}",
+                        params={"ref": "main"}, headers=headers, timeout=15)
+    if resp.status_code == 304:
+        return False, None, None, etag
+    if resp.status_code == 404:
+        return True, None, None, None
+    resp.raise_for_status()
+    data = resp.json()
+    raw = base64.b64decode(data["content"])
+    return True, raw, data.get("sha"), resp.headers.get("ETag")
+
+
+def delete_file(token: str, path: str, sha: str, message: str, *,
+                owner: str = config.DATA_REPO_OWNER,
+                repo: str = config.DATA_REPO_NAME) -> None:
+    resp = requests.delete(
+        f"{_api_base(owner, repo)}/contents/{path}", headers=_headers(token),
+        json={"message": message, "sha": sha, "branch": "main"}, timeout=20,
+    )
+    resp.raise_for_status()
+
+
 def list_dir(token: str, path: str, *, owner: str = config.DATA_REPO_OWNER,
             repo: str = config.DATA_REPO_NAME) -> list[dict]:
     """List entries in a "directory". Empty list if it doesn't exist."""

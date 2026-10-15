@@ -220,6 +220,8 @@ class AdminConsole(tk.Tk):
         btns.pack(fill="x", pady=(6, 4))
         ttk.Button(btns, text="Refresh now", command=self._refresh_dashboard).pack(
             side="left", padx=4)
+        ttk.Button(btns, text="Request log now",
+                  command=self._request_log_now).pack(side="left", padx=4)
         ttk.Button(btns, text="View logs for selected…",
                   command=self._open_logs_for_selected).pack(side="left", padx=4)
 
@@ -362,6 +364,36 @@ class AdminConsole(tk.Tk):
         self._status("Refreshing dashboard...")
         threading.Thread(target=self._refresh_worker, args=(token,),
                          daemon=True).start()
+
+    def _request_log_now(self) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Select a machine", "Select a row in the table first.")
+            return
+        token = self._require_token()
+        if not token:
+            return
+        mid = sel[0]
+        hostname = self._machines.get(mid, {}).get("hostname", mid)
+        self._status(f"Requesting log from {hostname}...")
+        threading.Thread(target=self._request_log_worker, args=(token, mid, hostname),
+                         daemon=True).start()
+
+    def _request_log_worker(self, token: str, mid: str, hostname: str) -> None:
+        body = {
+            "action": "upload_now",
+            "requested_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        try:
+            data_backend.put_json(token, f"requests/{mid}.json", body,
+                                  f"request log from {hostname}")
+        except Exception as exc:
+            self._ui_queue.put(lambda: self._status(f"Request failed: {exc}"))
+            return
+        self._ui_queue.put(lambda: self._status(
+            f"Requested — {hostname} should upload within ~15-20 sec "
+            f"(if it's online). Refresh the dashboard shortly, or use "
+            f"'View logs for selected…'."))
 
     def _refresh_worker(self, token: str) -> None:
         try:

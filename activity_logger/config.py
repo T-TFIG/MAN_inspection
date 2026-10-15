@@ -23,6 +23,12 @@ POLICY_PATH = "policy/policy.json"
 
 HEARTBEAT_INTERVAL_SEC_DEFAULT = 5 * 60   # overridden by policy.json if set
 
+# How often each machine checks for an admin "send your log now" request.
+# A conditional GET (ETag) is used so a steady "nothing requested" doesn't
+# count against the shared GitHub rate limit — safe to poll this often even
+# with many machines sharing one client token.
+REQUEST_POLL_INTERVAL_SEC = 15
+
 # --- Behaviour tuning -------------------------------------------------------
 POLL_INTERVAL_SEC = 2.0          # how often we sample the foreground window
 IDLE_THRESHOLD_SEC = 60.0        # no keyboard/mouse for this long => "Idle"

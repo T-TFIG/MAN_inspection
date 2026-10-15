@@ -14,6 +14,13 @@ One background thread (``CentralSync``) does three things on one timer
    the file lands in a place only the admin can read, with no per-machine
    mail credentials involved at all.
 
+A second, much faster thread (``RequestWatcher``) lets an admin pull a fresh
+log on demand — e.g. while debugging — instead of waiting for the next
+scheduled upload. It polls ``requests/<machine_id>.json`` every few seconds
+using a conditional GET (ETag), which GitHub does not count against the API
+rate limit when nothing changed, so this stays cheap even with many machines
+sharing one token.
+
 Everything here degrades to a no-op if ``_embedded.CLIENT_DATA_TOKEN`` is
 empty (a local dev build, or a build where the CI secret wasn't set) — same
 pattern as the email feature when its local secret file is missing.
@@ -224,5 +231,65 @@ class CentralSync(threading.Thread):
         if ok:
             self._upload_last_key = key
             _save_json(_upload_state_path(), {"last_key": key})
+        if self._notify:
+            self._notify(ok, info)
+
+
+def _request_path() -> str:
+    return f"requests/{machine_id.get_machine_id()}.json"
+
+
+class RequestWatcher(threading.Thread):
+    """Polls for an admin "send your log now" request, every few seconds.
+
+    Kept separate from CentralSync's slow heartbeat/upload cycle so an admin
+    debugging a machine doesn't have to wait out the full heartbeat interval.
+    """
+
+    def __init__(self, notify=None):
+        super().__init__(name="RequestWatcher", daemon=True)
+        self._notify = notify
+        self._stop = threading.Event()
+        self._etag: str | None = None
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        if not is_configured():
+            return
+        while not self._stop.wait(config.REQUEST_POLL_INTERVAL_SEC):
+            try:
+                self._check_once()
+            except Exception:
+                pass  # a missed check just gets retried next cycle
+
+    def _check_once(self) -> None:
+        path = _request_path()
+        changed, raw, sha, etag = data_backend.get_file_conditional(
+            CLIENT_DATA_TOKEN, path, self._etag)
+        if not changed:
+            return
+        self._etag = etag
+        if raw is None:
+            return  # no request file (404) — nothing pending
+
+        try:
+            request = json.loads(raw.decode("utf-8"))
+        except Exception:
+            request = {}
+
+        # Always remove the request first so a slow/failed upload never makes
+        # it fire again on every poll afterwards.
+        try:
+            data_backend.delete_file(CLIENT_DATA_TOKEN, path, sha,
+                                     "request handled")
+        except Exception:
+            pass
+        self._etag = None  # the file is gone; forget the stale ETag
+
+        if request.get("action") != "upload_now":
+            return
+        ok, info = upload_logs([datetime.now().date()], label="on-demand request")
         if self._notify:
             self._notify(ok, info)

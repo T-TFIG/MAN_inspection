@@ -27,6 +27,7 @@ class App:
         self._email_scheduler = EmailScheduler(notify=self._on_email_result)
         self._central_sync = central.CentralSync(self._settings,
                                                  notify=self._on_upload_result)
+        self._request_watcher = central.RequestWatcher(notify=self._on_upload_result)
         self._stopping = threading.Event()
 
     def start(self) -> None:
@@ -44,6 +45,7 @@ class App:
         self._email_scheduler.start()
         if central.is_configured():
             self._central_sync.start()
+            self._request_watcher.start()
         self._queue.put(Event("Start", detail=f"v{__version__}"))
 
         self._update_thread = threading.Thread(
@@ -63,6 +65,7 @@ class App:
         self._msgwin.stop()
         self._email_scheduler.stop()
         self._central_sync.stop()
+        self._request_watcher.stop()
         # Give the writer a moment to flush the final events, then stop it.
         time.sleep(0.5)
         self._writer.stop()
