@@ -235,8 +235,17 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
     with os.fdopen(fd, "w", encoding="ascii") as fh:
         fh.write(batch)
     creationflags = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
+    # CREATE_NO_WINDOW alone was reported to still flash a visible console
+    # on some real machines -- people clicking into it and accidentally
+    # closing it mid-update, interrupting the swap. Also pass
+    # STARTUPINFO/SW_HIDE, the other half of the standard Windows technique
+    # for guaranteeing a spawned console process never gets a window at
+    # all; the two together are more reliable than either alone.
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
     subprocess.Popen(["cmd", "/c", path], creationflags=creationflags,
-                     close_fds=True)
+                     startupinfo=startupinfo, close_fds=True)
 
 
 def was_just_relaunched_from_update() -> bool:
