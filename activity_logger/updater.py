@@ -147,9 +147,22 @@ def check_and_update(asset_name: str = config.RELEASE_ASSET_NAME) -> bool:
     try:
         with requests.get(download_url, stream=True, timeout=120) as r:
             r.raise_for_status()
+            expected_size = r.headers.get("Content-Length")
+            expected_size = int(expected_size) if expected_size else None
+            downloaded = 0
             with open(new_path, "wb") as fh:
                 for chunk in r.iter_content(chunk_size=65536):
                     fh.write(chunk)
+                    downloaded += len(chunk)
+        # A connection can drop mid-stream without requests raising (seen
+        # with some proxy/antivirus setups that return 200 then cut the
+        # body short) -- that leaves a truncated .new file which would
+        # otherwise get swapped in as-is, producing a broken exe ("Failed to
+        # load Python DLL" on launch). Treat a size mismatch the same as a
+        # failed download.
+        if expected_size is not None and downloaded != expected_size:
+            _cleanup(new_path)
+            return False
     except Exception:
         _cleanup(new_path)
         return False
