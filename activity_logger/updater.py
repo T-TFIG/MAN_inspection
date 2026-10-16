@@ -243,6 +243,11 @@ def _spawn_swapper(new_path: str, cur_path: str) -> bool:
         "if errorlevel 1 (\r\n"
         "  set /a tries+=1\r\n"
         "  if %tries% GEQ 20 goto relaunch\r\n"
+        # Windows won't overwrite an exe that is still running. If the old
+        # process hasn't exited a few seconds after asking it to (seen on a
+        # real machine: it lingered past all 20 retries, so the swap never
+        # happened and the OLD version was relaunched), end it ourselves.
+        f'  if %tries% EQU 4 taskkill /F /IM "{os.path.basename(cur_path)}" >NUL 2>&1\r\n'
         "  ping -n 2 127.0.0.1 >NUL\r\n"
         "  goto trymove\r\n"
         ")\r\n"
