@@ -33,7 +33,7 @@ from ttkbootstrap.constants import *  # noqa: F403  (LEFT/RIGHT/X/BOTH/... const
 from tkinter import filedialog, messagebox
 
 from . import __version__, config, data_backend, updater
-from .central import DEFAULT_POLICY, MAX_FILE_REQUEST_BYTES
+from .central import DEFAULT_POLICY, MAX_FILE_REQUEST_BYTES, MAX_RANGE_DAYS
 
 _WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 ONLINE_WITHIN_SEC = 15 * 60  # heartbeat default is 5 min; allow for a couple misses
@@ -848,6 +848,10 @@ class AdminConsole(ttk.Window):
         except Exception:
             update_request = None
         try:
+            range_request, _ = data_backend.get_json(token, f"range_requests/{mid}.json")
+        except Exception:
+            range_request = None
+        try:
             labels, labels_sha = data_backend.get_json(token, LABELS_PATH)
             labels = labels or {}
         except Exception:
@@ -860,10 +864,11 @@ class AdminConsole(ttk.Window):
             names = []
         self._ui_queue.put(lambda: self._render_machine_details(
             token, mid, hostname, request, file_request, update_request,
-            labels, labels_sha, names, win))
+            labels, labels_sha, names, win, range_request))
 
     def _render_machine_details(self, token, mid, hostname, request, file_request,
-                                update_request, labels, labels_sha, names, win=None):
+                                update_request, labels, labels_sha, names, win=None,
+                                range_request=None):
         self._status("Ready")
         if win is None or not win.winfo_exists():
             win = ttk.Toplevel(title=f"Machine details — {hostname}")
@@ -874,6 +879,7 @@ class AdminConsole(ttk.Window):
         win.var_owner.set(labels.get(mid, {}).get("owner", ""))
         self._fill_request_section(win, token, mid, hostname, request)
         self._fill_file_request_section(win, token, mid, hostname, file_request)
+        self._fill_range_section(win, token, mid, hostname, range_request)
         self._fill_update_section(win, token, mid, hostname, update_request)
         self._fill_logs_section(win, token, mid, names)
         self._fill_last_download_section(win, mid)
@@ -943,6 +949,35 @@ class AdminConsole(ttk.Window):
                  bootstyle=SECONDARY).pack(anchor=W, pady=(4, 0))
         win.file_status_box = ttk.Frame(win.file_request_frame)
         win.file_status_box.pack(fill=X, pady=(6, 0))
+
+        win.range_frame = ttk.Labelframe(
+            body, text="Request log by time range  -  from / to (that computer's local time)",
+            bootstyle=SUCCESS, padding=10)
+        win.range_frame.pack(fill=X, padx=14, pady=(0, 8))
+        now = datetime.now()
+        win.var_range = {
+            "sd": tk.StringVar(value=now.strftime("%Y-%m-%d")),
+            "st": tk.StringVar(value="00:00"),
+            "ed": tk.StringVar(value=now.strftime("%Y-%m-%d")),
+            "et": tk.StringVar(value=now.strftime("%H:%M")),
+        }
+        grid = ttk.Frame(win.range_frame)
+        grid.pack(anchor=W)
+        for r, (label, dk, tk_) in enumerate((("From", "sd", "st"), ("To", "ed", "et"))):
+            ttk.Label(grid, text=label, width=5).grid(row=r, column=0, pady=2, sticky=W)
+            ttk.Entry(grid, textvariable=win.var_range[dk], width=12).grid(
+                row=r, column=1, padx=(0, 6))
+            ttk.Entry(grid, textvariable=win.var_range[tk_], width=7).grid(
+                row=r, column=2, padx=(0, 6))
+        ttk.Button(grid, text="Request range", bootstyle=SUCCESS,
+                  command=lambda: self._details_range_request(win, token, mid, hostname)
+                  ).grid(row=0, column=3, rowspan=2, padx=(10, 0))
+        ttk.Label(win.range_frame, bootstyle=SECONDARY, wraplength=520,
+                 text=f"Date as YYYY-MM-DD, time as HH:MM (24h). Up to {MAX_RANGE_DAYS} days. "
+                      "Reads that machine's local daily logs, including days not yet uploaded."
+                 ).pack(anchor=W, pady=(4, 0))
+        win.range_status_box = ttk.Frame(win.range_frame)
+        win.range_status_box.pack(fill=X, pady=(6, 0))
 
         win.update_frame = ttk.Labelframe(
             body, text="Force update  —  check for and apply a new version now",
@@ -1104,6 +1139,164 @@ class AdminConsole(ttk.Window):
             self._machine_details_worker(token, mid, hostname, win)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _fill_range_section(self, win, token, mid, hostname, request) -> None:
+        for child in win.range_status_box.winfo_children():
+            child.destroy()
+        if not request:
+            return
+        status = request.get("status", "pending")
+        span = f"{request.get('start', '?')}  ->  {request.get('end', '?')}"
+        if status == "done" and request.get("remote_file"):
+            ttk.Label(win.range_status_box, wraplength=480,
+                     text=f"✅ Ready — {span}\n{request.get('rows', 0)} rows, completed "
+                          f"{_relative_time(request.get('completed_at', ''))}"
+                     ).pack(anchor=W, pady=(0, 6))
+            ttk.Label(win.range_status_box, bootstyle=SECONDARY, wraplength=480,
+                     text="Downloading removes it from the server (one-time pickup)."
+                     ).pack(anchor=W, pady=(0, 4))
+            row = ttk.Frame(win.range_status_box)
+            row.pack(anchor=W)
+            remote_name = request["remote_file"]
+            ttk.Button(row, text="Download & open", bootstyle=PRIMARY,
+                      command=lambda: self._details_range_download(
+                          win, token, mid, hostname, remote_name, open_after=True)
+                      ).pack(side=LEFT, padx=(0, 6))
+            ttk.Button(row, text="Download…", bootstyle=(SECONDARY, OUTLINE),
+                      command=lambda: self._details_range_download(
+                          win, token, mid, hostname, remote_name, open_after=False)
+                      ).pack(side=LEFT)
+        elif status == "done":
+            ttk.Label(win.range_status_box, wraplength=480,
+                     text=f"ℹ {span}\nNo activity was recorded in that range "
+                          f"(the program only logs while it is running)."
+                     ).pack(anchor=W)
+        elif status == "collected":
+            ttk.Label(win.range_status_box, wraplength=480,
+                     text=f"📦 Collected — {span}\ndownloaded and removed from server "
+                          f"{_relative_time(request.get('collected_at', ''))}"
+                     ).pack(anchor=W)
+        elif status == "error":
+            ttk.Label(win.range_status_box, wraplength=480, bootstyle=DANGER,
+                     text=f"⚠ Failed — {span}\n{request.get('error', 'unknown error')}"
+                     ).pack(anchor=W)
+        else:
+            ttk.Label(win.range_status_box, wraplength=480,
+                     text=f"⏳ Pending — {span}\nrequested "
+                          f"{_relative_time(request.get('requested_at', ''))}"
+                     ).pack(anchor=W, pady=(0, 6))
+            ttk.Button(win.range_status_box, text="Cancel request", bootstyle=DANGER,
+                      command=lambda: self._details_range_cancel(win, token, mid, hostname)
+                      ).pack(anchor=W)
+
+    def _details_range_request(self, win, token, mid, hostname) -> None:
+        v = {k: x.get().strip() for k, x in win.var_range.items()}
+        try:
+            start = datetime.strptime(f"{v['sd']} {v['st']}", "%Y-%m-%d %H:%M")
+            end = datetime.strptime(f"{v['ed']} {v['et']}", "%Y-%m-%d %H:%M")
+        except ValueError:
+            messagebox.showwarning("Check the time range",
+                                   "Use date as YYYY-MM-DD and time as HH:MM (24-hour).")
+            return
+        end = end.replace(second=59)
+        if end < start:
+            messagebox.showwarning("Check the time range", "'To' is earlier than 'From'.")
+            return
+        if (end.date() - start.date()).days + 1 > MAX_RANGE_DAYS:
+            messagebox.showwarning("Range too long",
+                                   f"Choose at most {MAX_RANGE_DAYS} days at a time.")
+            return
+        self._status(f"Requesting log range from {hostname}...")
+
+        def work():
+            body = {
+                "action": "log_range",
+                "status": "pending",
+                "start": start.strftime("%Y-%m-%d %H:%M:%S"),
+                "end": end.strftime("%Y-%m-%d %H:%M:%S"),
+                "requested_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            try:
+                data_backend.put_json_retrying(token, f"range_requests/{mid}.json", body,
+                                               f"request log range from {hostname}")
+            except Exception as exc:
+                self._ui_queue.put(lambda: self._status(f"Request failed: {exc}"))
+                return
+            self._machine_details_worker(token, mid, hostname, win)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _details_range_cancel(self, win, token, mid, hostname) -> None:
+        def work():
+            try:
+                _, sha = data_backend.get_file(token, f"range_requests/{mid}.json")
+                if sha:
+                    data_backend.delete_file(token, f"range_requests/{mid}.json", sha,
+                                             "range request cancelled")
+            except Exception as exc:
+                self._ui_queue.put(lambda: self._status(f"Cancel failed: {exc}"))
+                return
+            self._ui_queue.put(lambda: self._status("Range request cancelled."))
+            self._machine_details_worker(token, mid, hostname, win)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _details_range_download(self, win, token, mid, hostname, remote_name, *,
+                                open_after: bool) -> None:
+        dest = None
+        if not open_after:
+            dest = filedialog.asksaveasfilename(
+                parent=win, title="Save log range as", initialfile=remote_name,
+                defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
+            if not dest:
+                return
+        threading.Thread(target=self._range_download_worker,
+                         args=(win, token, mid, hostname, remote_name, open_after, dest),
+                         daemon=True).start()
+
+    def _range_download_worker(self, win, token, mid, hostname, remote_name,
+                               open_after, dest) -> None:
+        remote_path = f"range_logs/{mid}/{remote_name}"
+        try:
+            raw, sha = data_backend.get_file(token, remote_path)
+            if raw is None:
+                raise RuntimeError("file no longer exists on the server")
+        except Exception as exc:
+            self._ui_queue.put(lambda: messagebox.showerror("Download failed", str(exc)))
+            return
+        try:
+            if open_after:
+                fd, local_path = tempfile.mkstemp(suffix=f"_{remote_name}")
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(raw)
+            else:
+                local_path = dest
+                with open(local_path, "wb") as fh:
+                    fh.write(raw)
+        except Exception as exc:
+            self._ui_queue.put(lambda: messagebox.showerror("Save failed", str(exc)))
+            return
+        _record_download(mid, remote_name, local_path)
+        try:
+            if sha:
+                data_backend.delete_file(token, remote_path, sha, "log range collected")
+        except Exception:
+            pass
+        try:
+            req_raw, req_sha = data_backend.get_file(token, f"range_requests/{mid}.json")
+            if req_raw:
+                body = json.loads(req_raw.decode("utf-8"))
+                body["status"] = "collected"
+                body["collected_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                data_backend.put_json(token, f"range_requests/{mid}.json", body,
+                                      "range collected", sha=req_sha)
+        except Exception:
+            pass
+        if open_after:
+            self._ui_queue.put(lambda: os.startfile(local_path))
+        else:
+            self._ui_queue.put(lambda: self._status(f"Saved to {local_path}"))
+        self._machine_details_worker(token, mid, hostname, win)
 
     def _fill_update_section(self, win, token, mid, hostname, request) -> None:
         for child in win.update_status_box.winfo_children():

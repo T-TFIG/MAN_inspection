@@ -323,6 +323,97 @@ def _file_request_path() -> str:
     return f"file_requests/{machine_id.get_machine_id()}.json"
 
 
+def _range_request_path() -> str:
+    return f"range_requests/{machine_id.get_machine_id()}.json"
+
+
+MAX_RANGE_DAYS = 31
+_RANGE_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def build_log_range(start_text: str, end_text: str) -> tuple[bool, str, dict]:
+    """Collect the activity rows between two local timestamps into one file.
+
+    Reads the per-day activity_*.xlsx files covering the range, keeps rows
+    whose own Date+Time fall inside [start, end] (a Window row is stamped
+    when its segment ENDS, so a segment straddling `start` is not included),
+    and uploads the result for the admin to pick up. Returns
+    (ok, message, extra_fields) like download_requested_file().
+    """
+    from io import BytesIO
+
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Font
+
+    from .excel_writer import HEADERS
+
+    if not is_configured():
+        return False, "central upload not configured on this build", {}
+    try:
+        start = datetime.strptime(start_text, _RANGE_FMT)
+        end = datetime.strptime(end_text, _RANGE_FMT)
+    except Exception:
+        return False, "invalid start/end time", {}
+    if end < start:
+        return False, "end is before start", {}
+    if (end.date() - start.date()).days + 1 > MAX_RANGE_DAYS:
+        return False, f"range too long (max {MAX_RANGE_DAYS} days)", {}
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "activity"
+    ws.append(HEADERS)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    rows_out = 0
+    day = start.date()
+    while day <= end.date():
+        src = _path_for(day)
+        if os.path.exists(src):
+            try:
+                # Copy first: the writer may have the live file open/locked.
+                with open(src, "rb") as fh:
+                    snapshot = BytesIO(fh.read())
+                sheet = load_workbook(snapshot, read_only=True).active
+                header = None
+                for row in sheet.iter_rows(values_only=True):
+                    if header is None:
+                        header = list(row)
+                        continue
+                    rec = dict(zip(header, row))
+                    stamp = f"{rec.get('Date') or ''} {rec.get('Time') or ''}".strip()
+                    try:
+                        when = datetime.strptime(stamp, _RANGE_FMT)
+                    except Exception:
+                        continue
+                    if start <= when <= end:
+                        ws.append([rec.get(h) for h in HEADERS])
+                        rows_out += 1
+            except Exception as exc:
+                return False, f"could not read {os.path.basename(src)}: {exc}", {}
+        day += timedelta(days=1)
+
+    if rows_out == 0:
+        return True, "no activity recorded in that range", {"rows": 0}
+
+    buf = BytesIO()
+    wb.save(buf)
+    content = buf.getvalue()
+    if len(content) > MAX_FILE_REQUEST_BYTES:
+        return False, "result too large; choose a shorter range", {}
+
+    mid = machine_id.get_machine_id()
+    name = (f"range_{start.strftime('%Y%m%d-%H%M')}_to_"
+            f"{end.strftime('%Y%m%d-%H%M')}.xlsx")
+    try:
+        data_backend.put_bytes_retrying(CLIENT_DATA_TOKEN, f"range_logs/{mid}/{name}",
+                                        content, f"upload log range {name}")
+    except Exception as exc:
+        return False, f"upload failed: {exc}", {}
+    return True, "uploaded", {"remote_file": name, "rows": rows_out}
+
+
 def _update_request_path() -> str:
     return f"update_requests/{machine_id.get_machine_id()}.json"
 
@@ -401,6 +492,7 @@ class RequestWatcher(threading.Thread):
         self._etag: str | None = None
         self._file_etag: str | None = None
         self._update_etag: str | None = None
+        self._range_etag: str | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -419,6 +511,10 @@ class RequestWatcher(threading.Thread):
                 pass  # a missed check just gets retried next cycle
             try:
                 self._check_file_request_once()
+            except Exception:
+                pass
+            try:
+                self._check_range_request_once()
             except Exception:
                 pass
             try:
@@ -520,6 +616,45 @@ class RequestWatcher(threading.Thread):
         if self._notify:
             label = requested_path or "(no path)"
             self._notify(ok, f"file request {label}: {message}")
+
+    def _check_range_request_once(self) -> None:
+        path = _range_request_path()
+        changed, raw, sha, etag = data_backend.get_file_conditional(
+            CLIENT_DATA_TOKEN, path, self._range_etag)
+        if not changed:
+            return
+        self._range_etag = etag
+        if raw is None:
+            return
+
+        try:
+            request = json.loads(raw.decode("utf-8"))
+        except Exception:
+            request = {}
+        if request.get("status") in ("done", "error", "collected"):
+            return
+        if request.get("action") != "log_range":
+            return
+
+        ok, message, extra = build_log_range(request.get("start", ""),
+                                             request.get("end", ""))
+        body = dict(request)
+        body["completed_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        if ok:
+            body["status"] = "done"
+            body.update(extra)
+            body["note"] = message
+        else:
+            body["status"] = "error"
+            body["error"] = message
+        try:
+            data_backend.put_json(CLIENT_DATA_TOKEN, path, body,
+                                  "range request handled", sha=sha)
+        except Exception:
+            pass
+        self._range_etag = None
+        if self._notify:
+            self._notify(ok, f"log range request: {message}")
 
     def _check_update_request_once(self) -> None:
         path = _update_request_path()
