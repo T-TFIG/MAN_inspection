@@ -7,7 +7,7 @@
   - Downloads the latest MAN_inspection.exe from GitHub Releases (or uses
     -ExePath if you already have a copy), installs it to
     C:\ProgramData\MAN_inspection\app\MAN_inspection.exe, and registers a
-    Scheduled Task that starts it at logon for any user — no console window,
+    Scheduled Task that starts it at logon for any user - no console window,
     no time limit, restarts a few times if it crashes.
   - Run this ONCE per employee machine, as Administrator (e.g. via GPO startup
     script, Intune, PDQ Deploy, or manually).

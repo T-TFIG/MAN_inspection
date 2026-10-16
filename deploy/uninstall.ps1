@@ -12,7 +12,7 @@ Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Silent
 Write-Host "Scheduled task removed (if it existed)."
 
 if (Test-Path $InstallDir) {
-    # Keep email_config.json / admin_settings.json out of this by default —
+    # Keep email_config.json / admin_settings.json out of this by default -
     # remove just the app binary, not the whole config folder, unless asked.
     $appDir = Join-Path $InstallDir "app"
     if (Test-Path $appDir) {
