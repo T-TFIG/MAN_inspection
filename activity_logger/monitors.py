@@ -102,13 +102,39 @@ def _likely_document_path(pid: int) -> str:
     """
     try:
         proc = psutil.Process(pid)
+        locks = []
         for f in proc.open_files():
             path = f.path
             _, ext = os.path.splitext(path)
-            if ext.lower() in _DOCUMENT_EXTENSIONS:
-                return path
+            if ext.lower() not in _DOCUMENT_EXTENSIONS:
+                continue
+            if os.path.basename(path).startswith("~$"):
+                locks.append(path)  # Office's hidden owner/lock file, not the document
+                continue
+            return path
+        # Office keeps a "~$name.xlsx" lock file open beside the document and
+        # it vanishes when the document closes, so it's useless to request;
+        # point at the real document next to it instead.
+        for lock in locks:
+            real = _document_for_lock_file(lock)
+            if real:
+                return real
     except Exception:
         pass
+    return ""
+
+
+def _document_for_lock_file(lock_path: str) -> str:
+    folder, name = os.path.split(lock_path)
+    tail = name[2:]  # Office drops/keeps the leading characters depending on name length
+    try:
+        siblings = [n for n in os.listdir(folder) if not n.startswith("~$")]
+    except OSError:
+        return ""
+    exact = [n for n in siblings if n == tail]
+    fuzzy = [n for n in siblings if tail and n.endswith(tail)]
+    for n in exact + fuzzy:
+        return os.path.join(folder, n)
     return ""
 
 
