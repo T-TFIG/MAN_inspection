@@ -138,6 +138,38 @@ def _document_for_lock_file(lock_path: str) -> str:
     return ""
 
 
+def explorer_window_path(hwnd) -> str:
+    """Full path of what an Explorer window is showing.
+
+    If one or more items are selected, the first selected item's FULL path
+    (a file, usually -- that's what an admin wants to request); otherwise the
+    folder being browsed. Needs COM initialised on the calling thread.
+    """
+    try:
+        shell = win32com.client.Dispatch("Shell.Application")
+        for window in shell.Windows():
+            try:
+                if window.HWND != hwnd:
+                    continue
+                doc = window.Document
+                folder = doc.Folder.Self.Path or ""
+                try:
+                    items = doc.SelectedItems()
+                    count = items.Count
+                    if count:
+                        first = items.Item(0).Path or ""
+                        if first:
+                            return first + (f"  (+{count - 1} more selected)" if count > 1 else "")
+                except Exception:
+                    pass
+                return folder
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
 def foreground_window_path(app: str, pid: int = 0) -> str:
     """Best-effort "what file/folder is open" for the current foreground app.
 
@@ -154,19 +186,7 @@ def foreground_window_path(app: str, pid: int = 0) -> str:
         hwnd = win32gui.GetForegroundWindow()
         if not hwnd:
             return ""
-        try:
-            shell = win32com.client.Dispatch("Shell.Application")
-            for window in shell.Windows():
-                try:
-                    if window.HWND != hwnd:
-                        continue
-                    folder = window.Document.Folder.Self.Path
-                    return folder or ""
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return ""
+        return explorer_window_path(hwnd)
 
     if pid:
         return _likely_document_path(pid)
@@ -254,6 +274,16 @@ class Poller(threading.Thread):
             self._cur_path = foreground_window_path(app, pid)
             self._seg_start = time.monotonic()
             self._have_segment = True
+        elif app.lower() == "explorer.exe":
+            # Selecting a different file in the same folder doesn't change the
+            # window title, so it would never show up on its own. Re-check the
+            # path each tick (Explorer only) and start a new row when it moves.
+            path = foreground_window_path(app, pid)
+            if path != self._cur_path:
+                self._close_segment()
+                self._cur_path = path
+                self._seg_start = time.monotonic()
+                self._have_segment = True
 
     def _close_segment(self) -> None:
         if not self._have_segment:
