@@ -230,32 +230,53 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
         ":relaunch\r\n"
         # A real-world detection confirmed Windows Defender actively
         # quarantines/scans things tied to this update mechanism on some
-        # machines (its heuristics flag the download-and-run pattern).
-        # Launching the just-written exe immediately risks a race against
-        # that scan -- a plausible cause of the intermittent "Failed to
-        # load Python DLL" some machines hit right after a swap, which
-        # then resolves itself on a later attempt. A short settle delay
-        # here, after the move and before exec, gives a same-machine AV
-        # scan more time to finish first.
+        # machines (its heuristics flag the download-and-run pattern), and
+        # a plain delay before launching (tried first) wasn't reliable
+        # enough -- a fixed wait is a guess at how long a scan takes, and
+        # still lost the race on a real machine. Forcing a full synchronous
+        # read of the file via `certutil -hashfile` triggers Windows'
+        # on-access AV scan deterministically right here, during a step we
+        # fully control and retry around -- not during the actual launch,
+        # where a scan-in-progress lock reliably produces "Failed to load
+        # Python DLL". If antivirus is going to intervene, this makes it
+        # happen now instead of during the exec attempt.
+        f'certutil -hashfile "{cur_path}" SHA256 >NUL 2>&1\r\n'
         "ping -n 2 127.0.0.1 >NUL\r\n"
         f'start "" "{cur_path}" --post-update\r\n'
         'del "%~f0"\r\n'
     )
-    fd, path = tempfile.mkstemp(suffix="_update.bat")
+    fd, bat_path = tempfile.mkstemp(suffix="_update.bat")
     with os.fdopen(fd, "w", encoding="ascii") as fh:
         fh.write(batch)
+
+    # Launch the batch through a VBScript run via wscript.exe instead of
+    # invoking cmd.exe directly. CREATE_NO_WINDOW + STARTUPINFO/SW_HIDE
+    # (Win32-level flags on the cmd.exe process) were still reported to
+    # flash a visible console on a real machine -- Windows 11's default
+    # Windows Terminal console host can intercept a newly spawned console
+    # process into a new tab under some configurations regardless of
+    # those flags, since it manages console allocation itself.
+    # wscript.exe has no console subsystem at all (it's a plain Win32 GUI
+    # app), so there is nothing console-related for any terminal host to
+    # intercept; WScript.Shell.Run's window-style argument (0 = hidden)
+    # is a COM-level directive, a completely different mechanism, and is
+    # the standard bulletproof technique for a batch script that must
+    # never show a window under any console-host configuration.
+    vbs = (
+        'Set shell = CreateObject("WScript.Shell")\r\n'
+        f'shell.Run "cmd /c ""{bat_path}""", 0, False\r\n'
+    )
+    vfd, vbs_path = tempfile.mkstemp(suffix="_update.vbs")
+    with os.fdopen(vfd, "w", encoding="ascii") as fh:
+        fh.write(vbs)
+
     creationflags = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
-    # CREATE_NO_WINDOW alone was reported to still flash a visible console
-    # on some real machines -- people clicking into it and accidentally
-    # closing it mid-update, interrupting the swap. Also pass
-    # STARTUPINFO/SW_HIDE, the other half of the standard Windows technique
-    # for guaranteeing a spawned console process never gets a window at
-    # all; the two together are more reliable than either alone.
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
-    subprocess.Popen(["cmd", "/c", path], creationflags=creationflags,
-                     startupinfo=startupinfo, close_fds=True)
+    subprocess.Popen(["wscript.exe", "//B", "//Nologo", vbs_path],
+                     creationflags=creationflags, startupinfo=startupinfo,
+                     close_fds=True)
 
 
 def was_just_relaunched_from_update() -> bool:
@@ -276,7 +297,7 @@ def was_just_relaunched_from_update() -> bool:
 
 
 def cleanup_stale_update_scripts() -> None:
-    """Best-effort sweep of leftover *_update.bat files from past attempts.
+    """Best-effort sweep of leftover *_update.bat/*_update.vbs from past attempts.
 
     Call once at normal startup (after we know we're NOT mid-update). Only
     removes files old enough (10+ minutes) that they cannot be a swap that's
@@ -286,7 +307,7 @@ def cleanup_stale_update_scripts() -> None:
         tmp_dir = tempfile.gettempdir()
         cutoff = time.time() - 600
         for name in os.listdir(tmp_dir):
-            if not name.endswith("_update.bat"):
+            if not name.endswith(("_update.bat", "_update.vbs")):
                 continue
             path = os.path.join(tmp_dir, name)
             try:
