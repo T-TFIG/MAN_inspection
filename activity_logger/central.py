@@ -476,8 +476,13 @@ def download_requested_file(path: str) -> tuple[bool, str, dict]:
     """
     if not is_configured():
         return False, "central upload not configured on this build", {}
+    if path and os.path.isdir(path):
+        # A path copied from an Explorer row in the log is a FOLDER; saying
+        # "file not found" for it sent people hunting for a missing file.
+        return False, ("this path is a folder, not a file - request a file inside "
+                       "it (full path including the extension)"), {}
     if not path or not os.path.isfile(path):
-        return False, "file not found", {}
+        return False, "file not found (check the exact path, including the extension)", {}
     try:
         size = os.path.getsize(path)
     except OSError as exc:
