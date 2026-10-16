@@ -76,31 +76,34 @@ def _latest_release(asset_name: str = config.RELEASE_ASSET_NAME) -> tuple[object
 _UPDATE_COOLDOWN_SEC = 300  # 5 minutes
 
 
-def _cooldown_path() -> str:
-    return os.path.join(config.data_dir(), "last_update_attempt.txt")
+def _cooldown_path(asset_name: str) -> str:
+    # Keyed by asset name so the employee logger and admin console -- which
+    # can both be installed on the same machine (e.g. an admin's own PC) --
+    # don't share one cooldown and suppress each other's update attempts.
+    return os.path.join(config.data_dir(), f"last_update_attempt_{asset_name}.txt")
 
 
-def _recently_attempted() -> bool:
+def _recently_attempted(asset_name: str) -> bool:
     try:
-        with open(_cooldown_path(), "r", encoding="ascii") as fh:
+        with open(_cooldown_path(asset_name), "r", encoding="ascii") as fh:
             last = float(fh.read().strip())
     except Exception:
         return False
     return (time.time() - last) < _UPDATE_COOLDOWN_SEC
 
 
-def _mark_attempt() -> None:
+def _mark_attempt(asset_name: str) -> None:
     try:
         os.makedirs(config.data_dir(), exist_ok=True)
-        with open(_cooldown_path(), "w", encoding="ascii") as fh:
+        with open(_cooldown_path(asset_name), "w", encoding="ascii") as fh:
             fh.write(str(time.time()))
     except Exception:
         pass
 
 
-def _clear_cooldown() -> None:
+def _clear_cooldown(asset_name: str) -> None:
     try:
-        os.remove(_cooldown_path())
+        os.remove(_cooldown_path(asset_name))
     except Exception:
         pass
 
@@ -132,12 +135,12 @@ def check_and_update(asset_name: str = config.RELEASE_ASSET_NAME) -> bool:
     except InvalidVersion:
         return False
     if version <= current:
-        _clear_cooldown()
+        _clear_cooldown(asset_name)
         return False
 
-    if _recently_attempted():
+    if _recently_attempted(asset_name):
         return False
-    _mark_attempt()
+    _mark_attempt(asset_name)
 
     exe_path = sys.executable
     new_path = exe_path + ".new"
