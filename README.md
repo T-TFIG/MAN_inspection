@@ -338,3 +338,15 @@ irm https://raw.githubusercontent.com/T-TFIG/MAN_inspection/main/deploy/install.
 > แวบขึ้นมาได้อยู่ดี ตอนนี้เพิ่ม `STARTUPINFO` + `SW_HIDE` (อีกครึ่งหนึ่งของเทคนิคมาตรฐานสำหรับซ่อน
 > หน้าต่าง console บน Windows) เข้าไปด้วย ทดสอบจริงแล้วด้วยการจับภาพหน้าจอระหว่างขั้นตอน swap
 > ทั้งหมด ไม่มีหน้าต่างใดๆ ปรากฏให้เห็นเลย
+>
+> **v0.4.11:** ยังเจอ "Failed to load Python DLL" เป็นครั้งคราวอยู่ (เปิดไม่ติดรอบแรกหลัง swap
+> แต่พอลองใหม่กลับเปิดได้ปกติ) — เจอหลักฐานจริงจาก Windows Defender บนเครื่องทดสอบว่า Defender
+> ตรวจจับ/กักกัน (quarantine) รูปแบบคำสั่ง "โหลดสคริปต์มาแล้ว pipe เข้า iex ทันที" ของเราเอง (ทั้ง
+> `install.ps1` และกลไก self-update ใช้รูปแบบนี้เหมือนกัน) เพราะหน้าตาคล้าย pattern ที่มัลแวร์ใช้
+> บ่อย แม้เราจะไม่ได้เป็นอันตรายจริงก็ตาม มีความเป็นไปได้สูงที่ Defender จะสแกน/ล็อกไฟล์ exe ที่เพิ่ง
+> swap เข้าไปใหม่ชั่วขณะ พอดีกับตอนที่เราพยายามเปิดมันทันที ทำให้เปิดไม่ติดชั่วคราว — เพิ่ม delay
+> สั้นๆ ก่อนเปิดโปรแกรมใหม่ (หลัง move ไฟล์เสร็จ ก่อนสั่ง start) ให้ Defender มีเวลาสแกนเสร็จก่อน
+>
+> **แนะนำสำหรับแก้ที่ต้นตอจริงๆ:** เพิ่ม Exclusion ใน Windows Defender ให้โฟลเดอร์
+> `C:\ProgramData\MAN_inspection` (Windows Security → Virus & threat protection → Manage
+> settings → Add or remove exclusions) จะตัดปัญหานี้ไปเลยทั้งหมด ไม่ต้องพึ่ง delay

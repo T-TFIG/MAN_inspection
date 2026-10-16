@@ -228,6 +228,16 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
         "  goto trymove\r\n"
         ")\r\n"
         ":relaunch\r\n"
+        # A real-world detection confirmed Windows Defender actively
+        # quarantines/scans things tied to this update mechanism on some
+        # machines (its heuristics flag the download-and-run pattern).
+        # Launching the just-written exe immediately risks a race against
+        # that scan -- a plausible cause of the intermittent "Failed to
+        # load Python DLL" some machines hit right after a swap, which
+        # then resolves itself on a later attempt. A short settle delay
+        # here, after the move and before exec, gives a same-machine AV
+        # scan more time to finish first.
+        "ping -n 2 127.0.0.1 >NUL\r\n"
         f'start "" "{cur_path}" --post-update\r\n'
         'del "%~f0"\r\n'
     )
