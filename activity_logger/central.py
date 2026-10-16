@@ -184,6 +184,16 @@ def send_heartbeat(extra: dict | None = None) -> None:
 # --- central upload (replaces per-machine email as the default transport) --
 
 
+def _is_valid_xlsx(content: bytes) -> bool:
+    import zipfile
+    from io import BytesIO
+    try:
+        with zipfile.ZipFile(BytesIO(content)) as zf:
+            return zf.testzip() is None and "xl/workbook.xml" in zf.namelist()
+    except Exception:
+        return False
+
+
 def upload_logs(dates: list, label: str = "") -> tuple[bool, str]:
     if not is_configured():
         return False, "central upload not configured on this build"
@@ -198,6 +208,11 @@ def upload_logs(dates: list, label: str = "") -> tuple[bool, str]:
                 content = fh.read()
         except Exception:
             continue
+        # Never overwrite the good copy on the server with a broken file (a
+        # truncated workbook from a mid-save kill got uploaded this way and
+        # replaced a readable log).
+        if not _is_valid_xlsx(content):
+            return False, f"local log {os.path.basename(src)} is damaged; not uploaded"
         path = f"logs/{mid}/{os.path.basename(src)}"
         try:
             # _retrying (not plain put_bytes): re-uploading the SAME day's

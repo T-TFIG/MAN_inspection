@@ -54,6 +54,7 @@ class ExcelWriter(threading.Thread):
         super().__init__(name="ExcelWriter", daemon=True)
         self._queue = event_queue
         self._stop = threading.Event()
+        self._pending: list[Event] = []
 
     def stop(self) -> None:
         self._stop.set()
@@ -62,9 +63,22 @@ class ExcelWriter(threading.Thread):
 
     def run(self) -> None:
         while not self._stop.is_set():
-            batch = self._drain()
+            batch = self._pending + self._drain()
+            self._pending = []
             if batch:
-                self._write(batch)
+                self._pending = self._write(batch)[-_MAX_PENDING_EVENTS:]
+        # Shutdown: flush everything still queued plus anything a locked file
+        # held back, so the final events (and "Stop") aren't lost.
+        leftover = self._pending
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not None:
+                leftover.append(item)
+        if leftover:
+            self._pending = self._write(leftover)
 
     def _drain(self) -> list[Event]:
         batch: list[Event] = []
@@ -84,28 +98,20 @@ class ExcelWriter(threading.Thread):
                 batch.append(item)
         return batch
 
-    def _write(self, batch: list[Event]) -> None:
+    def _write(self, batch: list[Event]) -> list[Event]:
+        """Append the batch to its day files; return events that couldn't be written."""
         # Events in a batch almost always share one day, but split just in case
         # the clock rolls over midnight mid-batch.
         by_day: dict[date, list[Event]] = {}
         for ev in batch:
             by_day.setdefault(ev.time.date(), []).append(ev)
 
+        failed: list[Event] = []
         for day, events in by_day.items():
             path = _path_for(day)
+            tmp = path + ".tmp"
             try:
-                if os.path.exists(path):
-                    wb = load_workbook(path)
-                    ws = wb.active
-                    _migrate_header_if_needed(ws)
-                else:
-                    wb = Workbook()
-                    ws = wb.active
-                    ws.title = "activity"
-                    ws.append(HEADERS)
-                    for cell in ws[1]:
-                        cell.font = Font(bold=True)
-
+                wb, ws = _open_or_create(path)
                 for ev in events:
                     ws.append([
                         ev.time.strftime("%Y-%m-%d"),
@@ -116,12 +122,53 @@ class ExcelWriter(threading.Thread):
                         ev.path,
                         round(ev.duration, 1) if ev.duration is not None else "",
                     ])
-
-                wb.save(path)
+                # Save beside the real file, then swap it in. Saving straight
+                # over the day file means being killed mid-save (an update
+                # restart, a crash, power loss) leaves a truncated zip that
+                # no later write can open -- every event after that was being
+                # dropped, and uploads kept overwriting the good server copy
+                # with the broken file.
+                wb.save(tmp)
+                os.replace(tmp, path)
             except Exception as exc:  # pragma: no cover - keep logger alive
                 # Never let a transient file error (e.g. file open in Excel)
-                # kill the writer thread; drop the batch and carry on.
+                # kill the writer thread. Keep the events and retry next loop
+                # instead of discarding them.
                 _warn(f"could not write {path}: {exc}")
+                failed.extend(events)
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        return failed
+
+
+_MAX_PENDING_EVENTS = 5000
+
+
+def _open_or_create(path: str):
+    if os.path.exists(path):
+        try:
+            wb = load_workbook(path)
+            ws = wb.active
+            _migrate_header_if_needed(ws)
+            return wb, ws
+        except Exception as exc:
+            # Unreadable (truncated/corrupt). Keep it for the record but get
+            # out of its way so logging continues instead of failing forever.
+            aside = f"{path[:-5]}.corrupt-{datetime.now().strftime('%H%M%S')}.xlsx"
+            try:
+                os.replace(path, aside)
+                _warn(f"{path} was unreadable ({exc}); moved to {aside} and started a new file")
+            except OSError:
+                raise exc
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "activity"
+    ws.append(HEADERS)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    return wb, ws
 
 
 def _warn(msg: str) -> None:

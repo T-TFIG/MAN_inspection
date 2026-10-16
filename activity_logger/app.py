@@ -90,6 +90,13 @@ class App:
         # Give the writer a moment to flush the final events, then stop it.
         time.sleep(0.5)
         self._writer.stop()
+        # Wait for the writer to finish its current save and flush. It's a
+        # daemon thread: exiting the process while it is mid-save is exactly
+        # how a day's workbook got truncated.
+        try:
+            self._writer.join(timeout=8)
+        except RuntimeError:
+            pass  # never started
         self._tray.stop()
 
     def _send_now(self) -> None:
