@@ -23,6 +23,32 @@ def _path_for(day: date) -> str:
     return os.path.join(config.log_dir(), f"activity_{day.isoformat()}.xlsx")
 
 
+def _migrate_header_if_needed(ws) -> None:
+    """Insert any HEADERS column that's missing from an existing sheet.
+
+    A file created earlier in the day by an older build (before a column was
+    added — e.g. "Path" in v0.4.0) keeps its old header forever otherwise:
+    new rows from the updated app append positionally with no header to line
+    up under, so the newer values silently land one column over from what
+    their header says. Detected by column NAME, so this keeps working no
+    matter which column gets added in the future, not just "Path" today.
+    """
+    header = [cell.value for cell in ws[1]]
+    if header == HEADERS:
+        return
+    missing = [h for h in HEADERS if h not in header]
+    if not missing or set(header) - set(HEADERS):
+        return  # unexpected shape (extra/renamed columns) — don't guess, leave it alone
+    for name in missing:
+        # Insert at the position HEADERS says it belongs, so existing data
+        # in other columns is undisturbed — just shifted right from there.
+        col_idx = HEADERS.index(name) + 1  # openpyxl columns are 1-indexed
+        ws.insert_cols(col_idx)
+        cell = ws.cell(row=1, column=col_idx, value=name)
+        cell.font = Font(bold=True)
+        header.insert(col_idx - 1, name)
+
+
 class ExcelWriter(threading.Thread):
     def __init__(self, event_queue: "queue.Queue[Event]"):
         super().__init__(name="ExcelWriter", daemon=True)
@@ -71,6 +97,7 @@ class ExcelWriter(threading.Thread):
                 if os.path.exists(path):
                     wb = load_workbook(path)
                     ws = wb.active
+                    _migrate_header_if_needed(ws)
                 else:
                     wb = Workbook()
                     ws = wb.active
