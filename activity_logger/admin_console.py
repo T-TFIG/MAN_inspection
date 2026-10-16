@@ -972,6 +972,11 @@ class AdminConsole(ttk.Window):
         ttk.Button(grid, text="Request range", bootstyle=SUCCESS,
                   command=lambda: self._details_range_request(win, token, mid, hostname)
                   ).grid(row=0, column=3, rowspan=2, padx=(10, 0))
+        win.var_range_windows = tk.BooleanVar(value=True)
+        ttk.Checkbutton(win.range_frame, variable=win.var_range_windows,
+                       text="Also include Windows system events (start/shutdown, sleep/wake, "
+                            "logon/logoff) - fills days the program wasn't running",
+                       bootstyle="round-toggle").pack(anchor=W, pady=(6, 0))
         ttk.Label(win.range_frame, bootstyle=SECONDARY, wraplength=520,
                  text=f"Date as YYYY-MM-DD, time as HH:MM (24h). Up to {MAX_RANGE_DAYS} days. "
                       "Reads that machine's local daily logs, including days not yet uploaded."
@@ -1149,7 +1154,8 @@ class AdminConsole(ttk.Window):
         span = f"{request.get('start', '?')}  ->  {request.get('end', '?')}"
         if status == "done" and request.get("remote_file"):
             ttk.Label(win.range_status_box, wraplength=480,
-                     text=f"✅ Ready — {span}\n{request.get('rows', 0)} rows, completed "
+                     text=f"✅ Ready — {span}\n{request.get('rows', 0)} rows"
+                          f"{self._windows_rows_note(request)}, completed "
                           f"{_relative_time(request.get('completed_at', ''))}"
                      ).pack(anchor=W, pady=(0, 6))
             ttk.Label(win.range_status_box, bootstyle=SECONDARY, wraplength=480,
@@ -1189,6 +1195,11 @@ class AdminConsole(ttk.Window):
                       command=lambda: self._details_range_cancel(win, token, mid, hostname)
                       ).pack(anchor=W)
 
+    @staticmethod
+    def _windows_rows_note(request) -> str:
+        n = request.get("windows_rows")
+        return f" ({n} from Windows event log)" if n else ""
+
     def _details_range_request(self, win, token, mid, hostname) -> None:
         v = {k: x.get().strip() for k, x in win.var_range.items()}
         try:
@@ -1206,6 +1217,7 @@ class AdminConsole(ttk.Window):
             messagebox.showwarning("Range too long",
                                    f"Choose at most {MAX_RANGE_DAYS} days at a time.")
             return
+        include_windows = bool(win.var_range_windows.get())
         self._status(f"Requesting log range from {hostname}...")
 
         def work():
@@ -1214,6 +1226,7 @@ class AdminConsole(ttk.Window):
                 "status": "pending",
                 "start": start.strftime("%Y-%m-%d %H:%M:%S"),
                 "end": end.strftime("%Y-%m-%d %H:%M:%S"),
+                "include_windows": include_windows,
                 "requested_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
             try:

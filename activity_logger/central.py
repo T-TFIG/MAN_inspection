@@ -331,7 +331,8 @@ MAX_RANGE_DAYS = 31
 _RANGE_FMT = "%Y-%m-%d %H:%M:%S"
 
 
-def build_log_range(start_text: str, end_text: str) -> tuple[bool, str, dict]:
+def build_log_range(start_text: str, end_text: str,
+                    include_windows: bool = False) -> tuple[bool, str, dict]:
     """Collect the activity rows between two local timestamps into one file.
 
     Reads the per-day activity_*.xlsx files covering the range, keeps rows
@@ -339,6 +340,10 @@ def build_log_range(start_text: str, end_text: str) -> tuple[bool, str, dict]:
     when its segment ENDS, so a segment straddling `start` is not included),
     and uploads the result for the admin to pick up. Returns
     (ok, message, extra_fields) like download_requested_file().
+
+    With include_windows, also merges Windows' own boot/shutdown/sleep/wake/
+    logon events (see winevents.py) so days with no program log -- before
+    installation, or while it wasn't running -- still show machine state.
     """
     from io import BytesIO
 
@@ -366,7 +371,7 @@ def build_log_range(start_text: str, end_text: str) -> tuple[bool, str, dict]:
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
-    rows_out = 0
+    collected = []  # (datetime, row) from the program's own logs and Windows
     day = start.date()
     while day <= end.date():
         src = _path_for(day)
@@ -388,11 +393,23 @@ def build_log_range(start_text: str, end_text: str) -> tuple[bool, str, dict]:
                     except Exception:
                         continue
                     if start <= when <= end:
-                        ws.append([rec.get(h) for h in HEADERS])
-                        rows_out += 1
+                        collected.append((when, [rec.get(h) for h in HEADERS]))
             except Exception as exc:
                 return False, f"could not read {os.path.basename(src)}: {exc}", {}
         day += timedelta(days=1)
+
+    windows_rows = 0
+    if include_windows:
+        from . import winevents
+        for when, label in winevents.collect(start, end):
+            collected.append((when, [when.strftime("%Y-%m-%d"), when.strftime("%H:%M:%S"),
+                                     "Windows", "Windows Event Log", label, None, None]))
+            windows_rows += 1
+
+    collected.sort(key=lambda item: item[0])  # stable: same-second rows keep their order
+    for _, row in collected:
+        ws.append(row)
+    rows_out = len(collected)
 
     if rows_out == 0:
         return True, "no activity recorded in that range", {"rows": 0}
@@ -411,7 +428,8 @@ def build_log_range(start_text: str, end_text: str) -> tuple[bool, str, dict]:
                                         content, f"upload log range {name}")
     except Exception as exc:
         return False, f"upload failed: {exc}", {}
-    return True, "uploaded", {"remote_file": name, "rows": rows_out}
+    return True, "uploaded", {"remote_file": name, "rows": rows_out,
+                              "windows_rows": windows_rows}
 
 
 def _update_request_path() -> str:
@@ -637,7 +655,8 @@ class RequestWatcher(threading.Thread):
             return
 
         ok, message, extra = build_log_range(request.get("start", ""),
-                                             request.get("end", ""))
+                                             request.get("end", ""),
+                                             bool(request.get("include_windows")))
         body = dict(request)
         body["completed_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         if ok:
