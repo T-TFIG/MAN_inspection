@@ -337,6 +337,7 @@ class AdminConsole(ttk.Window):
         table_frame.pack(fill=BOTH, expand=True)
 
         cols = ("hostname", "owner", "machine_id", "version", "status", "last_seen")
+        self._dashboard_columns = cols
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings",
                                  height=16, bootstyle=PRIMARY)
         headings = {"hostname": "Hostname", "owner": "Assigned to",
@@ -661,6 +662,12 @@ class AdminConsole(ttk.Window):
 
     def _details_save_owner(self, win, token, mid) -> None:
         owner = win.var_owner.get().strip()
+        # Feedback goes on the dialog itself (win.var_save_status), not just
+        # self._status() on the main Admin Console window -- that window is
+        # hidden behind this dialog for anyone actually using it, so a
+        # click-and-nothing-visibly-happens Save looked like it silently
+        # failed even though the write genuinely succeeded.
+        win.var_save_status.set("Saving...")
         self._status("Saving assigned-to...")
 
         def work():
@@ -678,11 +685,31 @@ class AdminConsole(ttk.Window):
                 data_backend.put_json_retrying(token, LABELS_PATH, current,
                                                f"set owner for {mid}", cached_sha=sha)
             except Exception as exc:
-                self._ui_queue.put(lambda: self._status(f"Save failed: {exc}"))
+                msg = f"Save failed: {exc}"
+                self._ui_queue.put(lambda: self._status(msg))
+                if win.winfo_exists():
+                    self._ui_queue.put(lambda: win.var_save_status.set(msg))
                 return
             self._ui_queue.put(lambda: self._status("Saved."))
+            if win.winfo_exists():
+                self._ui_queue.put(lambda: win.var_save_status.set("Saved ✓"))
+            # The Dashboard table shows this same owner as a column -- keep
+            # it in sync without the admin having to know to hit its
+            # separate Refresh button too.
+            self._ui_queue.put(lambda: self._update_dashboard_owner(mid, owner))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _update_dashboard_owner(self, mid: str, owner: str) -> None:
+        if mid in self._machines:
+            self._machines[mid]["owner"] = owner
+        if self.tree.exists(mid):
+            values = list(self.tree.item(mid, "values"))
+            if "owner" in self._dashboard_columns:
+                idx = self._dashboard_columns.index("owner")
+                if idx < len(values):
+                    values[idx] = owner
+                    self.tree.item(mid, values=values)
 
     # -- machine details dialog (status, pending/cancel, download, history) --
     def _open_machine_details(self) -> None:
@@ -744,7 +771,27 @@ class AdminConsole(ttk.Window):
         self._fill_last_download_section(win, mid)
 
     def _build_machine_details_widgets(self, win, token: str, mid: str, hostname: str) -> None:
-        info = ttk.Frame(win, padding=(14, 12, 14, 6))
+        # Pack the Refresh button as a footer FIRST (side=BOTTOM), before the
+        # scrollable content claims the rest of the window with expand=True
+        # -- packing it last instead would leave it fighting an already-full
+        # cavity. This dialog has grown a section at a time (file requests,
+        # force update, assigned-to, ...) without the window's fixed
+        # geometry ever growing to match, so the bottom -- previously this
+        # same Refresh button, packed directly on the window with no
+        # scrolling at all -- could end up clipped below the visible window
+        # with no indication it was still there. The scroll area keeps
+        # everything above this footer reachable regardless of how tall the
+        # content gets.
+        ttk.Button(win, text="Refresh", bootstyle=SECONDARY, command=lambda: (
+            threading.Thread(target=self._machine_details_worker,
+                             args=(token, mid, hostname, win), daemon=True).start()
+        )).pack(side=BOTTOM, pady=(0, 12))
+
+        win.scroll = ScrollableFrame(win)
+        win.scroll.pack(fill=BOTH, expand=True)
+        body = win.scroll.body
+
+        info = ttk.Frame(body, padding=(14, 12, 14, 6))
         info.pack(fill=X)
         ttk.Label(info, text=hostname, font=("Segoe UI", 13, "bold")).pack(anchor=W)
         ttk.Label(info, text=f"machine id: {mid}", bootstyle=SECONDARY).pack(anchor=W)
@@ -753,21 +800,25 @@ class AdminConsole(ttk.Window):
         owner_row.pack(fill=X, pady=(6, 0))
         ttk.Label(owner_row, text="Assigned to:").pack(side=LEFT, padx=(0, 6))
         win.var_owner = tk.StringVar()
-        ttk.Entry(owner_row, textvariable=win.var_owner, width=30).pack(
-            side=LEFT, padx=(0, 6))
+        owner_entry = ttk.Entry(owner_row, textvariable=win.var_owner, width=30)
+        owner_entry.pack(side=LEFT, padx=(0, 6))
+        owner_entry.bind("<Return>", lambda e: self._details_save_owner(win, token, mid))
         ttk.Button(owner_row, text="Save", bootstyle=(SECONDARY, OUTLINE),
                   command=lambda: self._details_save_owner(win, token, mid)
-                  ).pack(side=LEFT)
+                  ).pack(side=LEFT, padx=(0, 6))
+        win.var_save_status = tk.StringVar()
+        ttk.Label(owner_row, textvariable=win.var_save_status,
+                 bootstyle=SUCCESS).pack(side=LEFT)
         ttk.Label(info, text="Shown on the Dashboard — helps spot who a machine "
                  "belongs to (e.g. for following up on unusual activity).",
                  bootstyle=SECONDARY, wraplength=560).pack(anchor=W, pady=(2, 0))
 
-        win.request_frame = ttk.Labelframe(win, text="Request status", bootstyle=WARNING,
+        win.request_frame = ttk.Labelframe(body, text="Request status", bootstyle=WARNING,
                                            padding=10)
         win.request_frame.pack(fill=X, padx=14, pady=(4, 8))
 
         win.file_request_frame = ttk.Labelframe(
-            win, text="Request a specific file  —  by full path on that computer",
+            body, text="Request a specific file  —  by full path on that computer",
             bootstyle=DANGER, padding=10)
         win.file_request_frame.pack(fill=X, padx=14, pady=(0, 8))
         win.var_file_path = tk.StringVar()
@@ -786,7 +837,7 @@ class AdminConsole(ttk.Window):
         win.file_status_box.pack(fill=X, pady=(6, 0))
 
         win.update_frame = ttk.Labelframe(
-            win, text="Force update  —  check for and apply a new version now",
+            body, text="Force update  —  check for and apply a new version now",
             bootstyle=INFO, padding=10)
         win.update_frame.pack(fill=X, padx=14, pady=(0, 8))
         ttk.Button(win.update_frame, text="Force update now", bootstyle=INFO,
@@ -795,18 +846,18 @@ class AdminConsole(ttk.Window):
         win.update_status_box = ttk.Frame(win.update_frame)
         win.update_status_box.pack(fill=X, pady=(6, 0))
 
-        win.download_frame = ttk.Labelframe(win, text="Last downloaded on this computer",
+        win.download_frame = ttk.Labelframe(body, text="Last downloaded on this computer",
                                             bootstyle=INFO, padding=10)
         win.download_frame.pack(fill=X, padx=14, pady=(0, 8))
         win.var_last_download = tk.StringVar(value="Not downloaded yet.")
         ttk.Label(win.download_frame, textvariable=win.var_last_download,
                  wraplength=480).pack(anchor=W)
 
-        logs_box = ttk.Labelframe(win, text="All uploaded logs", padding=10)
-        logs_box.pack(fill=BOTH, expand=True, padx=14, pady=(0, 8))
+        logs_box = ttk.Labelframe(body, text="All uploaded logs", padding=10)
+        logs_box.pack(fill=X, padx=14, pady=(0, 12))
         win.listbox = tk.Listbox(logs_box, relief="flat", borderwidth=0,
-                                 highlightthickness=1)
-        win.listbox.pack(fill=BOTH, expand=True)
+                                 highlightthickness=1, height=8)
+        win.listbox.pack(fill=X)
         btn_row = ttk.Frame(logs_box)
         btn_row.pack(fill=X, pady=(8, 0))
         ttk.Button(btn_row, text="Download & open", bootstyle=PRIMARY,
@@ -815,11 +866,6 @@ class AdminConsole(ttk.Window):
         ttk.Button(btn_row, text="Download…", bootstyle=(SECONDARY, OUTLINE),
                   command=lambda: self._details_download(win, token, mid, open_after=False)
                   ).pack(side=LEFT)
-
-        ttk.Button(win, text="Refresh", bootstyle=SECONDARY, command=lambda: (
-            threading.Thread(target=self._machine_details_worker,
-                             args=(token, mid, hostname, win), daemon=True).start()
-        )).pack(pady=(0, 12))
 
     def _fill_request_section(self, win, token, mid, hostname, request) -> None:
         for child in win.request_frame.winfo_children():
