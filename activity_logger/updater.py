@@ -73,8 +73,50 @@ def _latest_release(asset_name: str = config.RELEASE_ASSET_NAME) -> tuple[object
     return version, url
 
 
+_UPDATE_COOLDOWN_SEC = 300  # 5 minutes
+
+
+def _cooldown_path() -> str:
+    return os.path.join(config.data_dir(), "last_update_attempt.txt")
+
+
+def _recently_attempted() -> bool:
+    try:
+        with open(_cooldown_path(), "r", encoding="ascii") as fh:
+            last = float(fh.read().strip())
+    except Exception:
+        return False
+    return (time.time() - last) < _UPDATE_COOLDOWN_SEC
+
+
+def _mark_attempt() -> None:
+    try:
+        os.makedirs(config.data_dir(), exist_ok=True)
+        with open(_cooldown_path(), "w", encoding="ascii") as fh:
+            fh.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _clear_cooldown() -> None:
+    try:
+        os.remove(_cooldown_path())
+    except Exception:
+        pass
+
+
 def check_and_update(asset_name: str = config.RELEASE_ASSET_NAME) -> bool:
-    """Returns True if an update was started (caller should then exit)."""
+    """Returns True if an update was started (caller should then exit).
+
+    If a swap was attempted recently but the running exe still reports the
+    old version (the swap's `move` failed, e.g. antivirus briefly locking the
+    fresh download, so the relaunch came back up on the old build), skip
+    re-attempting for a few minutes. Without this, a stuck swap turns into an
+    unbounded exit-relaunch-exit loop: this is called before any other
+    thread starts, so the app never reaches CentralSync/RequestWatcher,
+    which from the admin's side looks like the machine stopped responding to
+    everything, not just updates.
+    """
     if not _is_frozen():
         return False
 
@@ -90,7 +132,12 @@ def check_and_update(asset_name: str = config.RELEASE_ASSET_NAME) -> bool:
     except InvalidVersion:
         return False
     if version <= current:
+        _clear_cooldown()
         return False
+
+    if _recently_attempted():
+        return False
+    _mark_attempt()
 
     exe_path = sys.executable
     new_path = exe_path + ".new"
@@ -160,7 +207,7 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
         f'move /Y "{new_path}" "{cur_path}" >NUL 2>&1\r\n'
         "if errorlevel 1 (\r\n"
         "  set /a tries+=1\r\n"
-        "  if %tries% GEQ 10 goto relaunch\r\n"
+        "  if %tries% GEQ 20 goto relaunch\r\n"
         "  ping -n 2 127.0.0.1 >NUL\r\n"
         "  goto trymove\r\n"
         ")\r\n"
