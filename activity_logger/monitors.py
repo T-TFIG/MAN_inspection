@@ -19,7 +19,9 @@ from ctypes import wintypes
 from types import SimpleNamespace
 
 import psutil
+import pythoncom
 import win32api
+import win32com.client
 import win32con
 import win32gui
 import win32gui_struct
@@ -64,6 +66,39 @@ def foreground_window() -> tuple[str, str]:
     return proc, title
 
 
+def foreground_window_path(app: str) -> str:
+    """Best-effort "what file/folder is open" for the current foreground app.
+
+    There is no general Windows API for this — each app stores it
+    differently (if at all). The one case we CAN resolve reliably is File
+    Explorer, via the Shell.Application COM automation object, which lists
+    every open Explorer window with its real filesystem path. Everything
+    else returns "" (the window title, already logged separately, is often
+    the next best hint for apps that put a filename in their title bar).
+
+    Must be called from a thread where COM has been initialized
+    (pythoncom.CoInitialize()) — see Poller.run().
+    """
+    if app.lower() != "explorer.exe":
+        return ""
+    hwnd = win32gui.GetForegroundWindow()
+    if not hwnd:
+        return ""
+    try:
+        shell = win32com.client.Dispatch("Shell.Application")
+        for window in shell.Windows():
+            try:
+                if window.HWND != hwnd:
+                    continue
+                folder = window.Document.Folder.Self.Path
+                return folder or ""
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
 # --- poller thread -----------------------------------------------------------
 
 
@@ -82,6 +117,7 @@ class Poller(threading.Thread):
         self._stop = threading.Event()
         self._cur_app = ""
         self._cur_title = ""
+        self._cur_path = ""
         self._seg_start = time.monotonic()
         self._have_segment = False
         self._is_idle = False
@@ -90,8 +126,18 @@ class Poller(threading.Thread):
         self._stop.set()
 
     def run(self) -> None:
+        # The Explorer-path lookup uses COM (Shell.Application), which needs
+        # the apartment initialized on whichever thread calls it.
+        pythoncom.CoInitialize()
+        try:
+            self._run()
+        finally:
+            pythoncom.CoUninitialize()
+
+    def _run(self) -> None:
         # Seed with the current window so the first real change has a duration.
         self._cur_app, self._cur_title = foreground_window()
+        self._cur_path = foreground_window_path(self._cur_app)
         self._seg_start = time.monotonic()
         self._have_segment = True
 
@@ -120,6 +166,7 @@ class Poller(threading.Thread):
             self._is_idle = False
             # Start a fresh window segment on resume.
             self._cur_app, self._cur_title = foreground_window()
+            self._cur_path = foreground_window_path(self._cur_app)
             self._seg_start = time.monotonic()
             self._have_segment = True
             if self._settings.track_idle:
@@ -130,6 +177,7 @@ class Poller(threading.Thread):
         if app != self._cur_app or title != self._cur_title:
             self._close_segment()
             self._cur_app, self._cur_title = app, title
+            self._cur_path = foreground_window_path(app)
             self._seg_start = time.monotonic()
             self._have_segment = True
 
@@ -139,7 +187,7 @@ class Poller(threading.Thread):
         duration = time.monotonic() - self._seg_start
         if self._settings.track_window and (self._cur_app or self._cur_title):
             self._emit(Event("Window", self._cur_app, self._cur_title,
-                             duration=duration))
+                             path=self._cur_path, duration=duration))
         self._have_segment = False
 
     def _emit(self, ev: Event) -> None:

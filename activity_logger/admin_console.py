@@ -33,10 +33,14 @@ from ttkbootstrap.constants import *  # noqa: F403  (LEFT/RIGHT/X/BOTH/... const
 from tkinter import filedialog, messagebox
 
 from . import __version__, config, data_backend, updater
-from .central import DEFAULT_POLICY
+from .central import DEFAULT_POLICY, MAX_FILE_REQUEST_BYTES
 
 _WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 ONLINE_WITHIN_SEC = 15 * 60  # heartbeat default is 5 min; allow for a couple misses
+# Shared, admin-editable "which human/desk is this machine" labels — lives in
+# the data repo (like policy.json) so every admin console sees the same
+# names, not just whoever set them.
+LABELS_PATH = "labels/machine_labels.json"
 _THEME = "bootstrap-light"
 
 
@@ -253,6 +257,8 @@ class AdminConsole(ttk.Window):
 
         self._sha = None
         self._machines: dict[str, dict] = {}
+        self._labels: dict[str, dict] = {}
+        self._labels_sha: str | None = None
 
         # Background threads never touch Tk widgets directly (Tk is not
         # thread-safe). They only push callables here; drained on a timer.
@@ -326,13 +332,13 @@ class AdminConsole(ttk.Window):
         table_frame = ttk.Frame(tab)
         table_frame.pack(fill=BOTH, expand=True)
 
-        cols = ("hostname", "machine_id", "version", "status", "last_seen")
+        cols = ("hostname", "owner", "machine_id", "version", "status", "last_seen")
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings",
                                  height=16, bootstyle=PRIMARY)
-        headings = {"hostname": "Hostname", "machine_id": "Machine ID",
-                    "version": "Version", "status": "Status",
+        headings = {"hostname": "Hostname", "owner": "Assigned to",
+                    "machine_id": "Machine ID", "version": "Version", "status": "Status",
                     "last_seen": "Last seen"}
-        widths = {"hostname": 160, "machine_id": 100, "version": 190,
+        widths = {"hostname": 140, "owner": 120, "machine_id": 100, "version": 170,
                   "status": 80, "last_seen": 100}
         for c in cols:
             self.tree.heading(c, text=headings[c])
@@ -402,6 +408,11 @@ class AdminConsole(ttk.Window):
                         bootstyle="round-toggle").grid(
             row=0, column=0, columnspan=2, sticky="w", **pad)
         self.upload_sched = ScheduleFields(upl, row=1, pad=pad)
+        self.var_retention_days = tk.IntVar(value=10)
+        ttk.Label(upl, text="Keep uploaded logs for (days, 0 = forever):").grid(
+            row=3, column=0, columnspan=2, sticky="e", **pad)
+        ttk.Spinbox(upl, textvariable=self.var_retention_days, from_=0, to=365,
+                   width=8).grid(row=3, column=2, sticky="w", **pad)
 
         ond = ttk.Labelframe(tab, text="On-demand requests  —  the Dashboard's "
                              "\"Request log now\" button", bootstyle=WARNING, padding=10)
@@ -589,6 +600,13 @@ class AdminConsole(ttk.Window):
             self._ui_queue.put(lambda: self._status(f"Dashboard refresh failed: {exc}"))
             return
 
+        try:
+            labels, labels_sha = data_backend.get_json(token, LABELS_PATH)
+            labels = labels or {}
+        except Exception:
+            labels, labels_sha = {}, None
+        self._labels_sha = labels_sha
+
         # Public info, no token needed — best-effort, dashboard still works
         # without it (version column just won't flag anything as outdated).
         latest = None
@@ -599,10 +617,11 @@ class AdminConsole(ttk.Window):
         except Exception:
             pass
 
-        self._ui_queue.put(lambda: self._apply_dashboard(machines, latest))
+        self._ui_queue.put(lambda: self._apply_dashboard(machines, labels, latest))
 
-    def _apply_dashboard(self, machines: dict, latest=None) -> None:
+    def _apply_dashboard(self, machines: dict, labels: dict, latest=None) -> None:
         self._machines = machines
+        self._labels = labels
         self.tree.delete(*self.tree.get_children())
         online_count = 0
         outdated_count = 0
@@ -619,12 +638,13 @@ class AdminConsole(ttk.Window):
                     version_text = f"{version_text} (v{latest} available)"
                     is_outdated = True
                     outdated_count += 1
+            owner = labels.get(mid, {}).get("owner", "")
             # One tag per row (not stacked) — avoids relying on Tk's tag
             # priority rules, which are easy to get backwards.
             tag = "outdated" if is_outdated else ("online" if online else "offline")
             self.tree.insert(
                 "", "end", iid=mid,
-                values=(m.get("hostname", "?"), mid, version_text,
+                values=(m.get("hostname", "?"), owner, mid, version_text,
                        "Online" if online else "Offline", _relative_time(last_seen)),
                 tags=(tag,),
             )
@@ -634,6 +654,31 @@ class AdminConsole(ttk.Window):
         )
         suffix = f" — latest release is v{latest}" if latest is not None else ""
         self._status(f"Dashboard updated — {len(machines)} machine(s) known.{suffix}")
+
+    def _details_save_owner(self, win, token, mid) -> None:
+        owner = win.var_owner.get().strip()
+        self._status("Saving assigned-to...")
+
+        def work():
+            try:
+                # Fetch fresh (not the possibly-stale sha the dialog loaded
+                # with) since this file is shared across every machine —
+                # another admin or another dialog could have written to it
+                # since we last read it.
+                current, sha = data_backend.get_json(token, LABELS_PATH)
+                current = current or {}
+                entry = dict(current.get(mid, {}))
+                entry["owner"] = owner
+                entry["updated_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                current[mid] = entry
+                data_backend.put_json_retrying(token, LABELS_PATH, current,
+                                               f"set owner for {mid}", cached_sha=sha)
+            except Exception as exc:
+                self._ui_queue.put(lambda: self._status(f"Save failed: {exc}"))
+                return
+            self._ui_queue.put(lambda: self._status("Saved."))
+
+        threading.Thread(target=work, daemon=True).start()
 
     # -- machine details dialog (status, pending/cancel, download, history) --
     def _open_machine_details(self) -> None:
@@ -656,22 +701,35 @@ class AdminConsole(ttk.Window):
         except Exception:
             request = None
         try:
+            file_request, _ = data_backend.get_json(token, f"file_requests/{mid}.json")
+        except Exception:
+            file_request = None
+        try:
+            labels, labels_sha = data_backend.get_json(token, LABELS_PATH)
+            labels = labels or {}
+        except Exception:
+            labels, labels_sha = {}, None
+        try:
             entries = data_backend.list_dir(token, f"logs/{mid}")
             names = sorted((e["name"] for e in entries if e["name"].endswith(".xlsx")),
                           reverse=True)
         except Exception:
             names = []
         self._ui_queue.put(lambda: self._render_machine_details(
-            token, mid, hostname, request, names, win))
+            token, mid, hostname, request, file_request, labels, labels_sha, names, win))
 
-    def _render_machine_details(self, token, mid, hostname, request, names, win=None):
+    def _render_machine_details(self, token, mid, hostname, request, file_request,
+                                labels, labels_sha, names, win=None):
         self._status("Ready")
         if win is None or not win.winfo_exists():
             win = ttk.Toplevel(title=f"Machine details — {hostname}")
-            win.geometry("720x680")
-            win.minsize(680, 500)
+            win.geometry("720x860")
+            win.minsize(680, 580)
             self._build_machine_details_widgets(win, token, mid, hostname)
+        win.labels_sha = labels_sha
+        win.var_owner.set(labels.get(mid, {}).get("owner", ""))
         self._fill_request_section(win, token, mid, hostname, request)
+        self._fill_file_request_section(win, token, mid, hostname, file_request)
         self._fill_logs_section(win, token, mid, names)
         self._fill_last_download_section(win, mid)
 
@@ -681,9 +739,41 @@ class AdminConsole(ttk.Window):
         ttk.Label(info, text=hostname, font=("Segoe UI", 13, "bold")).pack(anchor=W)
         ttk.Label(info, text=f"machine id: {mid}", bootstyle=SECONDARY).pack(anchor=W)
 
+        owner_row = ttk.Frame(info)
+        owner_row.pack(fill=X, pady=(6, 0))
+        ttk.Label(owner_row, text="Assigned to:").pack(side=LEFT, padx=(0, 6))
+        win.var_owner = tk.StringVar()
+        ttk.Entry(owner_row, textvariable=win.var_owner, width=30).pack(
+            side=LEFT, padx=(0, 6))
+        ttk.Button(owner_row, text="Save", bootstyle=(SECONDARY, OUTLINE),
+                  command=lambda: self._details_save_owner(win, token, mid)
+                  ).pack(side=LEFT)
+        ttk.Label(info, text="Shown on the Dashboard — helps spot who a machine "
+                 "belongs to (e.g. for following up on unusual activity).",
+                 bootstyle=SECONDARY, wraplength=560).pack(anchor=W, pady=(2, 0))
+
         win.request_frame = ttk.Labelframe(win, text="Request status", bootstyle=WARNING,
                                            padding=10)
         win.request_frame.pack(fill=X, padx=14, pady=(4, 8))
+
+        win.file_request_frame = ttk.Labelframe(
+            win, text="Request a specific file  —  by full path on that computer",
+            bootstyle=DANGER, padding=10)
+        win.file_request_frame.pack(fill=X, padx=14, pady=(0, 8))
+        win.var_file_path = tk.StringVar()
+        path_row = ttk.Frame(win.file_request_frame)
+        path_row.pack(fill=X)
+        ttk.Entry(path_row, textvariable=win.var_file_path).pack(
+            side=LEFT, fill=X, expand=True, padx=(0, 6))
+        ttk.Button(path_row, text="Request file", bootstyle=DANGER,
+                  command=lambda: self._details_file_request(win, token, mid, hostname)
+                  ).pack(side=LEFT)
+        ttk.Label(win.file_request_frame,
+                 text=f"e.g. C:\\Users\\<name>\\Documents\\report.xlsx  "
+                      f"(max {MAX_FILE_REQUEST_BYTES // (1024*1024)} MB)",
+                 bootstyle=SECONDARY).pack(anchor=W, pady=(4, 0))
+        win.file_status_box = ttk.Frame(win.file_request_frame)
+        win.file_status_box.pack(fill=X, pady=(6, 0))
 
         win.download_frame = ttk.Labelframe(win, text="Last downloaded on this computer",
                                             bootstyle=INFO, padding=10)
@@ -751,6 +841,162 @@ class AdminConsole(ttk.Window):
                       command=lambda: self._details_cancel(win, token, mid, hostname)
                       ).pack(anchor=W)
 
+    def _fill_file_request_section(self, win, token, mid, hostname, request) -> None:
+        for child in win.file_status_box.winfo_children():
+            child.destroy()
+
+        if not request:
+            return  # nothing pending/ready — just the entry + button stays
+
+        status = request.get("status", "pending")
+        path = request.get("path", "?")
+        if status == "done":
+            ttk.Label(win.file_status_box,
+                     text=f"✅ Ready — {path}\n"
+                          f"completed {_relative_time(request.get('completed_at', ''))}  "
+                          f"({request.get('size', 0) / 1024:.0f} KB)",
+                     wraplength=480).pack(anchor=W, pady=(0, 6))
+            ttk.Label(win.file_status_box,
+                     text="Downloading removes it from the server (one-time pickup).",
+                     bootstyle=SECONDARY, wraplength=480).pack(anchor=W, pady=(0, 4))
+            row = ttk.Frame(win.file_status_box)
+            row.pack(anchor=W)
+            remote_name = request.get("remote_file")
+            ttk.Button(row, text="Download & open", bootstyle=PRIMARY,
+                      command=lambda: self._details_file_download(
+                          win, token, mid, hostname, remote_name, open_after=True)
+                      ).pack(side=LEFT, padx=(0, 6))
+            ttk.Button(row, text="Download…", bootstyle=(SECONDARY, OUTLINE),
+                      command=lambda: self._details_file_download(
+                          win, token, mid, hostname, remote_name, open_after=False)
+                      ).pack(side=LEFT)
+        elif status == "collected":
+            ttk.Label(win.file_status_box,
+                     text=f"📦 Collected — {path}\ndownloaded and removed from server "
+                          f"{_relative_time(request.get('collected_at', ''))}",
+                     wraplength=480).pack(anchor=W, pady=(0, 6))
+            ttk.Button(win.file_status_box, text="Request again",
+                      bootstyle=(DANGER, OUTLINE),
+                      command=lambda: self._details_file_request(win, token, mid, hostname)
+                      ).pack(anchor=W)
+        elif status == "error":
+            ttk.Label(win.file_status_box,
+                     text=f"⚠ Failed — {path}\n{request.get('error', 'unknown error')}",
+                     wraplength=480, bootstyle=DANGER).pack(anchor=W)
+        else:
+            ttk.Label(win.file_status_box,
+                     text=f"⏳ Pending — {path}\nrequested "
+                          f"{_relative_time(request.get('requested_at', ''))}",
+                     wraplength=480).pack(anchor=W, pady=(0, 6))
+            ttk.Button(win.file_status_box, text="Cancel request", bootstyle=DANGER,
+                      command=lambda: self._details_file_cancel(win, token, mid, hostname)
+                      ).pack(anchor=W)
+
+    def _details_file_request(self, win, token, mid, hostname) -> None:
+        path = win.var_file_path.get().strip()
+        if not path:
+            messagebox.showwarning("Path needed", "Enter a full file path first.")
+            return
+        self._status(f"Requesting {path} from {hostname}...")
+
+        def work():
+            body = {
+                "action": "download_file",
+                "status": "pending",
+                "path": path,
+                "requested_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            try:
+                data_backend.put_json_retrying(token, f"file_requests/{mid}.json", body,
+                                               f"request file from {hostname}")
+            except Exception as exc:
+                self._ui_queue.put(lambda: self._status(f"Request failed: {exc}"))
+                return
+            self._machine_details_worker(token, mid, hostname, win)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _details_file_cancel(self, win, token, mid, hostname) -> None:
+        def work():
+            try:
+                _, sha = data_backend.get_file(token, f"file_requests/{mid}.json")
+                if sha:
+                    data_backend.delete_file(token, f"file_requests/{mid}.json", sha,
+                                             "file request cancelled")
+            except Exception as exc:
+                self._ui_queue.put(lambda: self._status(f"Cancel failed: {exc}"))
+                return
+            self._ui_queue.put(lambda: self._status("File request cancelled."))
+            self._machine_details_worker(token, mid, hostname, win)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _details_file_download(self, win, token, mid, hostname, remote_name, *,
+                               open_after: bool) -> None:
+        dest = None
+        if not open_after:
+            dest = filedialog.asksaveasfilename(
+                parent=win, title="Save file as", initialfile=remote_name,
+                filetypes=[("All files", "*.*")],
+            )
+            if not dest:
+                return
+        threading.Thread(target=self._file_download_worker,
+                         args=(win, token, mid, hostname, remote_name, open_after, dest),
+                         daemon=True).start()
+
+    def _file_download_worker(self, win, token, mid, hostname, remote_name,
+                              open_after, dest) -> None:
+        remote_path = f"files/{mid}/{remote_name}"
+        try:
+            raw, sha = data_backend.get_file(token, remote_path)
+            if raw is None:
+                raise RuntimeError("file no longer exists on the server")
+        except Exception as exc:
+            self._ui_queue.put(lambda: messagebox.showerror("Download failed", str(exc)))
+            return
+
+        try:
+            if open_after:
+                fd, local_path = tempfile.mkstemp(suffix=f"_{remote_name}")
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(raw)
+            else:
+                local_path = dest
+                with open(local_path, "wb") as fh:
+                    fh.write(raw)
+        except Exception as exc:
+            self._ui_queue.put(lambda: messagebox.showerror("Save failed", str(exc)))
+            return
+        _record_download(mid, remote_name, local_path)
+
+        # One-shot pickup: remove it from the server now that the admin has
+        # a local copy, and mark the request "collected" (not deleted) so
+        # the dialog shows a clear terminal state instead of stale Download
+        # buttons pointing at a file that's now gone.
+        try:
+            if sha:
+                data_backend.delete_file(token, remote_path, sha,
+                                         "requested file collected")
+        except Exception:
+            pass
+        try:
+            req_raw, req_sha = data_backend.get_file(token, f"file_requests/{mid}.json")
+            if req_raw:
+                body = json.loads(req_raw.decode("utf-8"))
+                body["status"] = "collected"
+                body["collected_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                data_backend.put_json(token, f"file_requests/{mid}.json", body,
+                                      "file collected", sha=req_sha)
+        except Exception:
+            pass
+
+        if open_after:
+            self._ui_queue.put(lambda: os.startfile(local_path))
+        else:
+            self._ui_queue.put(lambda: self._status(f"Saved to {local_path}"))
+        self._machine_details_worker(token, mid, hostname, win)
+
     def _fill_logs_section(self, win, token, mid, names) -> None:
         win.listbox.delete(0, "end")
         win.log_names = names
@@ -796,7 +1042,8 @@ class AdminConsole(ttk.Window):
         threading.Thread(target=work, daemon=True).start()
 
     def _details_download(self, win, token, mid, *, open_after: bool,
-                          forced_name: str | None = None) -> None:
+                          forced_name: str | None = None,
+                          remote_dir: str = "logs") -> None:
         if forced_name:
             name = forced_name
         else:
@@ -805,31 +1052,32 @@ class AdminConsole(ttk.Window):
         if not name:
             return
         if open_after:
-            threading.Thread(target=self._download_and_open, args=(token, mid, name),
-                             daemon=True).start()
+            threading.Thread(target=self._download_and_open,
+                             args=(token, mid, name, remote_dir), daemon=True).start()
         else:
             dest = filedialog.asksaveasfilename(
-                parent=win, title="Save log as", initialfile=name,
-                defaultextension=".xlsx",
-                filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+                parent=win, title="Save file as", initialfile=name,
+                filetypes=[("All files", "*.*")],
             )
             if not dest:
                 return
-            threading.Thread(target=self._download_only, args=(token, mid, name, dest),
-                             daemon=True).start()
+            threading.Thread(target=self._download_only,
+                             args=(token, mid, name, dest, remote_dir), daemon=True).start()
         # Refresh the "last downloaded" panel shortly after, once the
         # background download has had time to record itself.
         win.after(1500, lambda: self._fill_last_download_section(win, mid))
 
-    def _fetch_log_bytes(self, token: str, mid: str, name: str) -> bytes:
-        raw, _ = data_backend.get_file(token, f"logs/{mid}/{name}")
+    def _fetch_log_bytes(self, token: str, mid: str, name: str,
+                         remote_dir: str = "logs") -> bytes:
+        raw, _ = data_backend.get_file(token, f"{remote_dir}/{mid}/{name}")
         if raw is None:
             raise RuntimeError("file no longer exists")
         return raw
 
-    def _download_only(self, token: str, mid: str, name: str, dest: str) -> None:
+    def _download_only(self, token: str, mid: str, name: str, dest: str,
+                       remote_dir: str = "logs") -> None:
         try:
-            raw = self._fetch_log_bytes(token, mid, name)
+            raw = self._fetch_log_bytes(token, mid, name, remote_dir)
             with open(dest, "wb") as fh:
                 fh.write(raw)
         except Exception as exc:
@@ -838,9 +1086,10 @@ class AdminConsole(ttk.Window):
         _record_download(mid, name, dest)
         self._ui_queue.put(lambda: self._status(f"Saved to {dest}"))
 
-    def _download_and_open(self, token: str, mid: str, name: str) -> None:
+    def _download_and_open(self, token: str, mid: str, name: str,
+                           remote_dir: str = "logs") -> None:
         try:
-            raw = self._fetch_log_bytes(token, mid, name)
+            raw = self._fetch_log_bytes(token, mid, name, remote_dir)
             fd, path = tempfile.mkstemp(suffix=f"_{name}")
             with os.fdopen(fd, "wb") as fh:
                 fh.write(raw)
@@ -888,6 +1137,7 @@ class AdminConsole(ttk.Window):
 
         self.var_upload_enabled.set(bool(policy["upload"].get("enabled", False)))
         self.upload_sched.set(policy["upload"])
+        self.var_retention_days.set(int(policy["upload"].get("retention_days", 10)))
 
         self.var_on_demand_enabled.set(bool(policy.get("on_demand", {}).get("enabled", True)))
         self._update_request_button_state()
@@ -924,7 +1174,8 @@ class AdminConsole(ttk.Window):
                 "track_session": self.var_track_session.get(),
             },
             "heartbeat_interval_sec": int(self.var_heartbeat.get()) * 60,
-            "upload": {"enabled": self.var_upload_enabled.get(), **upload_sched},
+            "upload": {"enabled": self.var_upload_enabled.get(),
+                      "retention_days": int(self.var_retention_days.get()), **upload_sched},
             "on_demand": {"enabled": self.var_on_demand_enabled.get()},
             "email": {
                 "enabled": self.var_email_enabled.get(),

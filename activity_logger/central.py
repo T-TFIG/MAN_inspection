@@ -14,12 +14,18 @@ One background thread (``CentralSync``) does three things on one timer
    the file lands in a place only the admin can read, with no per-machine
    mail credentials involved at all.
 
-A second, much faster thread (``RequestWatcher``) lets an admin pull a fresh
-log on demand — e.g. while debugging — instead of waiting for the next
-scheduled upload. It polls ``requests/<machine_id>.json`` every few seconds
-using a conditional GET (ETag), which GitHub does not count against the API
-rate limit when nothing changed, so this stays cheap even with many machines
-sharing one token.
+A second, much faster thread (``RequestWatcher``) lets an admin pull data on
+demand instead of waiting for a scheduled upload:
+
+* ``requests/<machine_id>.json`` — "send your log now" (today's Excel file).
+* ``file_requests/<machine_id>.json`` — "send me this one specific local
+  file" (an admin-supplied absolute path), uploaded to
+  ``files/<machine_id>/<flattened-path>`` if it exists and is under the size
+  cap (20 MB).
+
+Both are polled every few seconds using a conditional GET (ETag), which
+GitHub does not count against the API rate limit when nothing changed, so
+this stays cheap even with many machines sharing one token.
 
 Everything here degrades to a no-op if ``_embedded.CLIENT_DATA_TOKEN`` is
 empty (a local dev build, or a build where the CI secret wasn't set) — same
@@ -28,8 +34,9 @@ pattern as the email feature when its local secret file is missing.
 
 import json
 import os
+import re
 import threading
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from . import __version__, config, data_backend, machine_id, scheduling
 from ._embedded import CLIENT_DATA_TOKEN
@@ -88,6 +95,11 @@ DEFAULT_POLICY = {
         "send_time": "18:00",
         "day_of_week": "mon",
         "day_of_month": 1,
+        # How many days of uploaded logs to keep in the central data repo
+        # before a machine deletes its own older ones. Keeps the (public-
+        # facing-cost-wise private, but still a real git history) repo from
+        # growing forever. 0 disables cleanup (keep everything).
+        "retention_days": 10,
     },
     "email": {
         "enabled": False,
@@ -200,6 +212,44 @@ def upload_logs(dates: list, label: str = "") -> tuple[bool, str]:
     return True, f"uploaded {uploaded} file(s) to the central store"
 
 
+_LOG_NAME_RE = re.compile(r"^activity_(\d{4}-\d{2}-\d{2})\.xlsx$")
+
+
+def _retention_state_path() -> str:
+    return os.path.join(config.data_dir(), "retention_state.json")
+
+
+def cleanup_old_logs(retention_days: int) -> None:
+    """Delete this machine's own uploaded logs older than ``retention_days``.
+
+    Keeps the central repo from growing forever — every machine prunes only
+    its own files. retention_days <= 0 disables this (keep everything).
+    """
+    if not is_configured() or retention_days <= 0:
+        return
+    mid = machine_id.get_machine_id()
+    try:
+        entries = data_backend.list_dir(CLIENT_DATA_TOKEN, f"logs/{mid}")
+    except Exception:
+        return
+    cutoff = date.today() - timedelta(days=retention_days)
+    for entry in entries:
+        match = _LOG_NAME_RE.match(entry.get("name", ""))
+        if not match:
+            continue
+        try:
+            day = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if day >= cutoff:
+            continue
+        try:
+            data_backend.delete_file(CLIENT_DATA_TOKEN, entry["path"], entry["sha"],
+                                     f"retention cleanup ({retention_days}d)")
+        except Exception:
+            pass  # a missed delete just gets retried on the next cleanup pass
+
+
 class CentralSync(threading.Thread):
     """One timer driving heartbeat + policy pull + settings apply + upload."""
 
@@ -209,6 +259,7 @@ class CentralSync(threading.Thread):
         self._notify = notify
         self._stop = threading.Event()
         self._upload_last_key = _load_json(_upload_state_path(), {}).get("last_key")
+        self._last_cleanup_date = _load_json(_retention_state_path(), {}).get("date")
 
     def stop(self) -> None:
         self._stop.set()
@@ -231,6 +282,18 @@ class CentralSync(threading.Thread):
 
         send_heartbeat()
         self._maybe_upload(policy["upload"])
+        self._maybe_cleanup(policy["upload"].get("retention_days", 10))
+
+    def _maybe_cleanup(self, retention_days: int) -> None:
+        # Cheap throttle: at most once per calendar day — this does a
+        # directory listing plus potentially several deletes, no need to run
+        # it every heartbeat.
+        today_str = date.today().isoformat()
+        if self._last_cleanup_date == today_str:
+            return
+        cleanup_old_logs(retention_days)
+        self._last_cleanup_date = today_str
+        _save_json(_retention_state_path(), {"date": today_str})
 
     def _maybe_upload(self, upload_cfg: dict) -> None:
         if not upload_cfg.get("enabled"):
@@ -253,8 +316,66 @@ def _request_path() -> str:
     return f"requests/{machine_id.get_machine_id()}.json"
 
 
+def _file_request_path() -> str:
+    return f"file_requests/{machine_id.get_machine_id()}.json"
+
+
+# Kept well under GitHub's practical Contents-API limit: a PUT embeds the
+# file as base64 (~33% bigger) inside one JSON body, and large uploads get
+# unreliable well before the API's documented 100 MB ceiling.
+MAX_FILE_REQUEST_BYTES = 20 * 1024 * 1024
+
+
+def _safe_remote_name(path: str) -> str:
+    """Turn an absolute local path into one flat, collision-resistant name.
+
+    Keeps the original path visible in the name (for the admin's own
+    reference) rather than just the bare filename, since two different
+    requested files can easily share a basename.
+    """
+    cleaned = path.replace(":", "").replace("\\", "_").replace("/", "_").strip("_ ")
+    return cleaned or "file"
+
+
+def download_requested_file(path: str) -> tuple[bool, str, dict]:
+    """Upload one specific, admin-requested local file for pickup.
+
+    Returns (ok, message, extra_fields) — extra_fields is merged into the
+    request's "done" status (remote_file, size) on success.
+    """
+    if not is_configured():
+        return False, "central upload not configured on this build", {}
+    if not path or not os.path.isfile(path):
+        return False, "file not found", {}
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        return False, f"could not read file size: {exc}", {}
+    if size > MAX_FILE_REQUEST_BYTES:
+        limit_mb = MAX_FILE_REQUEST_BYTES // (1024 * 1024)
+        return False, f"file too large ({size / (1024*1024):.1f} MB, limit {limit_mb} MB)", {}
+    try:
+        with open(path, "rb") as fh:
+            content = fh.read()
+    except PermissionError:
+        return False, "permission denied reading this file", {}
+    except Exception as exc:
+        return False, f"could not read file: {exc}", {}
+
+    mid = machine_id.get_machine_id()
+    remote_name = _safe_remote_name(path)
+    remote_path = f"files/{mid}/{remote_name}"
+    try:
+        data_backend.put_bytes_retrying(CLIENT_DATA_TOKEN, remote_path, content,
+                                        f"upload requested file {remote_name}")
+    except Exception as exc:
+        return False, f"upload failed: {exc}", {}
+    return True, "uploaded", {"remote_file": remote_name, "size": size}
+
+
 class RequestWatcher(threading.Thread):
-    """Polls for an admin "send your log now" request, every few seconds.
+    """Polls for admin requests every few seconds: "send your log now" and
+    "send me this specific file".
 
     Kept separate from CentralSync's slow heartbeat/upload cycle so an admin
     debugging a machine doesn't have to wait out the full heartbeat interval.
@@ -266,6 +387,7 @@ class RequestWatcher(threading.Thread):
         self._notify = notify
         self._stop = threading.Event()
         self._etag: str | None = None
+        self._file_etag: str | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -282,6 +404,10 @@ class RequestWatcher(threading.Thread):
                 self._check_once()
             except Exception:
                 pass  # a missed check just gets retried next cycle
+            try:
+                self._check_file_request_once()
+            except Exception:
+                pass
 
     def _check_once(self) -> None:
         path = _request_path()
@@ -333,3 +459,47 @@ class RequestWatcher(threading.Thread):
 
         if self._notify:
             self._notify(ok, info)
+
+    def _check_file_request_once(self) -> None:
+        path = _file_request_path()
+        changed, raw, sha, etag = data_backend.get_file_conditional(
+            CLIENT_DATA_TOKEN, path, self._file_etag)
+        if not changed:
+            return
+        self._file_etag = etag
+        if raw is None:
+            return  # no request file (404) — nothing pending
+
+        try:
+            request = json.loads(raw.decode("utf-8"))
+        except Exception:
+            request = {}
+
+        # Already handled (our own write triggered this "changed" poll) —
+        # "done" or "error" are both terminal, nothing more to do.
+        if request.get("status") in ("done", "error", "collected"):
+            return
+        if request.get("action") != "download_file":
+            return
+
+        requested_path = request.get("path", "")
+        ok, message, extra = download_requested_file(requested_path)
+
+        body = dict(request)
+        body["completed_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        if ok:
+            body["status"] = "done"
+            body.update(extra)
+        else:
+            body["status"] = "error"
+            body["error"] = message
+        try:
+            data_backend.put_json(CLIENT_DATA_TOKEN, path, body,
+                                  "file request handled", sha=sha)
+        except Exception:
+            pass
+        self._file_etag = None
+
+        if self._notify:
+            label = requested_path or "(no path)"
+            self._notify(ok, f"file request {label}: {message}")

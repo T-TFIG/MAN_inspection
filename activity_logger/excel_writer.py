@@ -16,7 +16,7 @@ from openpyxl.styles import Font
 from . import config
 from .events import Event
 
-HEADERS = ["Date", "Time", "Event", "Application", "Detail", "Duration (s)"]
+HEADERS = ["Date", "Time", "Event", "Application", "Detail", "Path", "Duration (s)"]
 
 
 def _path_for(day: date) -> str:
@@ -86,6 +86,7 @@ class ExcelWriter(threading.Thread):
                         ev.kind,
                         ev.app,
                         ev.detail,
+                        ev.path,
                         round(ev.duration, 1) if ev.duration is not None else "",
                     ])
 
