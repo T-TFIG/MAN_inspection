@@ -35,6 +35,23 @@ def _headers(token: str) -> dict:
     }
 
 
+def _get_blob(token: str, owner: str, repo: str, sha: str) -> bytes:
+    """Fetch a blob's content directly by sha, via the Git Data API.
+
+    The Contents API's GET /contents/{path} silently returns an EMPTY
+    "content" field for any file over 1MB (documented GitHub behavior,
+    easy to miss since it's not an error -- base64-decoding that empty
+    string just produces empty bytes, so a request for a large file looks
+    like it "succeeded" while actually writing out nothing usable). The
+    Blobs API has no such limit (up to 100MB), so we fall back to it
+    whenever Contents didn't actually give us the bytes.
+    """
+    resp = requests.get(f"{_api_base(owner, repo)}/git/blobs/{sha}",
+                        headers=_headers(token), timeout=60)
+    resp.raise_for_status()
+    return base64.b64decode(resp.json()["content"])
+
+
 def get_file(token: str, path: str, *, owner: str = config.DATA_REPO_OWNER,
             repo: str = config.DATA_REPO_NAME) -> tuple[bytes | None, str | None]:
     """Return (raw_bytes, sha); (None, None) if the file does not exist."""
@@ -46,8 +63,17 @@ def get_file(token: str, path: str, *, owner: str = config.DATA_REPO_OWNER,
     data = resp.json()
     if isinstance(data, list):
         raise ValueError(f"{path!r} is a directory, not a file")
-    raw = base64.b64decode(data["content"])
-    return raw, data.get("sha")
+    sha = data.get("sha")
+    content = data.get("content")
+    if content:
+        raw = base64.b64decode(content)
+    elif data.get("size", 0) > 0:
+        # Non-empty file, but Contents API gave us no content -- the >1MB
+        # case described above.
+        raw = _get_blob(token, owner, repo, sha)
+    else:
+        raw = b""
+    return raw, sha
 
 
 def get_json(token: str, path: str, *, owner: str = config.DATA_REPO_OWNER,
@@ -162,7 +188,13 @@ def get_file_conditional(token: str, path: str, etag: str | None = None, *,
         return True, None, None, None
     resp.raise_for_status()
     data = resp.json()
-    raw = base64.b64decode(data["content"])
+    content = data.get("content")
+    if content:
+        raw = base64.b64decode(content)
+    elif data.get("size", 0) > 0:
+        raw = _get_blob(token, owner, repo, data.get("sha"))
+    else:
+        raw = b""
     return True, raw, data.get("sha"), resp.headers.get("ETag")
 
 
