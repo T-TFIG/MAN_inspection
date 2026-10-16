@@ -44,18 +44,40 @@ $LatestDownloadUrl = "https://github.com/T-TFIG/MAN_inspection/releases/latest/d
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-if (-not $ExePath) {
-    Write-Host "Downloading the latest release..."
-    Invoke-WebRequest -Uri $LatestDownloadUrl -OutFile $TargetExe
-} else {
-    if (-not (Test-Path $ExePath)) { throw "ExePath not found: $ExePath" }
-    Copy-Item -Path $ExePath -Destination $TargetExe -Force
+# Stop any already-running copy FIRST: downloading/copying over $TargetExe
+# while the exe is running fails with "file is being used by another
+# process" (Windows locks a running executable's image). A short pause after
+# Stop-Process gives the OS a moment to actually release the file handle,
+# since -Force kills it but the handle doesn't always free instantly.
+$running = Get-Process -Name "MAN_inspection" -ErrorAction SilentlyContinue
+if ($running) {
+    Write-Host "Stopping the currently running copy..."
+    $running | Stop-Process -Force
+    Start-Sleep -Milliseconds 500
+}
+
+# A few retries with a short wait: even after Stop-Process, something else
+# (antivirus briefly scanning the just-terminated exe, Explorer, etc.) can
+# hold the file handle a little longer.
+$attempts = 5
+for ($i = 1; $i -le $attempts; $i++) {
+    try {
+        if (-not $ExePath) {
+            Write-Host "Downloading the latest release..."
+            Invoke-WebRequest -Uri $LatestDownloadUrl -OutFile $TargetExe
+        } else {
+            if (-not (Test-Path $ExePath)) { throw "ExePath not found: $ExePath" }
+            Copy-Item -Path $ExePath -Destination $TargetExe -Force
+        }
+        break
+    } catch {
+        if ($i -ge $attempts) { throw }
+        Write-Host "  File still locked, retrying ($i/$attempts)..."
+        Start-Sleep -Seconds 2
+    }
 }
 
 Write-Host "Installed to $TargetExe"
-
-# Stop any already-running copy so the scheduled task starts a fresh one.
-Get-Process -Name "MAN_inspection" -ErrorAction SilentlyContinue | Stop-Process -Force
 
 # Remove a previous install of this task, if any, then register it fresh.
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
