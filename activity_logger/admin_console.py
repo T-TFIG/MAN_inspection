@@ -275,7 +275,11 @@ class AdminConsole(ttk.Window):
             self.after(400, self._refresh_dashboard)
         # Silent startup update check — same self-update mechanism as the
         # employee app, just pointed at the admin console's own asset name.
-        self.after(800, self._check_for_updates_startup)
+        # Skipped entirely if we were JUST relaunched by the swapper -- see
+        # updater.was_just_relaunched_from_update() for why this check can't
+        # rely solely on the cooldown file.
+        if not updater.was_just_relaunched_from_update():
+            self.after(800, self._check_for_updates_startup)
 
     # -- layout --
     def _build(self) -> None:

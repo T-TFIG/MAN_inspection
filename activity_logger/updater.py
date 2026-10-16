@@ -228,7 +228,7 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
         "  goto trymove\r\n"
         ")\r\n"
         ":relaunch\r\n"
-        f'start "" "{cur_path}"\r\n'
+        f'start "" "{cur_path}" --post-update\r\n'
         'del "%~f0"\r\n'
     )
     fd, path = tempfile.mkstemp(suffix="_update.bat")
@@ -237,6 +237,23 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
     creationflags = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
     subprocess.Popen(["cmd", "/c", path], creationflags=creationflags,
                      close_fds=True)
+
+
+def was_just_relaunched_from_update() -> bool:
+    """True if this process was started by the swapper (see _spawn_swapper).
+
+    A second, storage-independent safety net against the update-restart
+    loop (v0.4.4's cooldown file lives in data_dir() and could in principle
+    fail to persist on some real machine for a reason we can't fully rule
+    out from here -- restricted account, antivirus, disk state). This flag
+    costs nothing to check and can't fail to "persist": it's baked into the
+    very relaunch command, present on EVERY relaunch regardless of whether
+    the move succeeded or fell back to the old exe. The caller should skip
+    its own check_and_update() call for this one run when true, guaranteeing
+    the app reaches its normal threads (heartbeat, request handling) at
+    least once per relaunch no matter what the cooldown file says.
+    """
+    return "--post-update" in sys.argv[1:]
 
 
 def cleanup_stale_update_scripts() -> None:

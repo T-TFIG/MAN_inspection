@@ -40,12 +40,18 @@ class App:
 
     def start(self) -> None:
         # Update before anything else: if an update starts, exit immediately so
-        # the swapper can replace this exe.
-        try:
-            if updater.check_and_update():
-                return
-        except Exception:
-            pass
+        # the swapper can replace this exe. Skip this check entirely if we
+        # were JUST relaunched by the swapper -- a storage-independent
+        # circuit breaker for the update-restart loop, on top of updater's
+        # own cooldown file: this one can't fail to take effect no matter
+        # what state data_dir() is in, so this run always reaches the
+        # threads below instead of risking another immediate re-check.
+        if not updater.was_just_relaunched_from_update():
+            try:
+                if updater.check_and_update():
+                    return
+            except Exception:
+                pass
         # We're proceeding with a normal startup (no update in flight from
         # THIS launch) — safe to sweep up any stuck swapper scripts from a
         # past attempt that never finished.
