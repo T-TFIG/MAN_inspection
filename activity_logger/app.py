@@ -34,7 +34,8 @@ class App:
         # feedback for their own action.
         self._email_scheduler = EmailScheduler(notify=None)
         self._central_sync = central.CentralSync(self._settings, notify=None)
-        self._request_watcher = central.RequestWatcher(self._settings, notify=None)
+        self._request_watcher = central.RequestWatcher(
+            self._settings, notify=None, on_force_update=self.stop)
         self._stopping = threading.Event()
 
     def start(self) -> None:

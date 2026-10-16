@@ -22,6 +22,9 @@ demand instead of waiting for a scheduled upload:
   file" (an admin-supplied absolute path), uploaded to
   ``files/<machine_id>/<flattened-path>`` if it exists and is under the size
   cap (20 MB).
+* ``update_requests/<machine_id>.json`` — "check for and apply an update
+  right now" instead of waiting for the next periodic check (every 6h) or
+  the user noticing and clicking it themselves.
 
 Both are polled every few seconds using a conditional GET (ETag), which
 GitHub does not count against the API rate limit when nothing changed, so
@@ -38,7 +41,7 @@ import re
 import threading
 from datetime import date, datetime, timedelta
 
-from . import __version__, config, data_backend, machine_id, scheduling
+from . import __version__, config, data_backend, machine_id, scheduling, updater
 from ._embedded import CLIENT_DATA_TOKEN
 from .excel_writer import _path_for
 
@@ -320,6 +323,10 @@ def _file_request_path() -> str:
     return f"file_requests/{machine_id.get_machine_id()}.json"
 
 
+def _update_request_path() -> str:
+    return f"update_requests/{machine_id.get_machine_id()}.json"
+
+
 # Kept well under GitHub's practical Contents-API limit: a PUT embeds the
 # file as base64 (~33% bigger) inside one JSON body, and large uploads get
 # unreliable well before the API's documented 100 MB ceiling.
@@ -374,20 +381,26 @@ def download_requested_file(path: str) -> tuple[bool, str, dict]:
 
 
 class RequestWatcher(threading.Thread):
-    """Polls for admin requests every few seconds: "send your log now" and
-    "send me this specific file".
+    """Polls for admin requests every few seconds: "send your log now",
+    "send me this specific file", and "check for and apply an update now".
 
     Kept separate from CentralSync's slow heartbeat/upload cycle so an admin
     debugging a machine doesn't have to wait out the full heartbeat interval.
     """
 
-    def __init__(self, settings, notify=None):
+    def __init__(self, settings, notify=None, on_force_update=None):
         super().__init__(name="RequestWatcher", daemon=True)
         self._settings = settings
         self._notify = notify
+        # Zero-arg callback the App wires to its own clean-shutdown path
+        # (central.py has no reference to the App/tray, so it can't exit the
+        # process itself) — called once an update has actually been staged
+        # and this process needs to get out of the way for the swap script.
+        self._on_force_update = on_force_update
         self._stop = threading.Event()
         self._etag: str | None = None
         self._file_etag: str | None = None
+        self._update_etag: str | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -406,6 +419,10 @@ class RequestWatcher(threading.Thread):
                 pass  # a missed check just gets retried next cycle
             try:
                 self._check_file_request_once()
+            except Exception:
+                pass
+            try:
+                self._check_update_request_once()
             except Exception:
                 pass
 
@@ -503,3 +520,48 @@ class RequestWatcher(threading.Thread):
         if self._notify:
             label = requested_path or "(no path)"
             self._notify(ok, f"file request {label}: {message}")
+
+    def _check_update_request_once(self) -> None:
+        path = _update_request_path()
+        changed, raw, sha, etag = data_backend.get_file_conditional(
+            CLIENT_DATA_TOKEN, path, self._update_etag)
+        if not changed:
+            return
+        self._update_etag = etag
+        if raw is None:
+            return  # no request file (404) — nothing pending
+
+        try:
+            request = json.loads(raw.decode("utf-8"))
+        except Exception:
+            request = {}
+
+        if request.get("status") == "done":
+            return  # our own write; nothing new to do
+        if request.get("action") != "force_update":
+            return
+
+        # check_now() does the actual check-and-apply: if a newer release
+        # exists it downloads it and spawns the swapper, same as the
+        # periodic 6h check or the tray's "Check for updates" click.
+        started, message = updater.check_now()
+
+        body = dict(request)
+        body["status"] = "done"
+        body["completed_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        body["result"] = message
+        try:
+            data_backend.put_json(CLIENT_DATA_TOKEN, path, body,
+                                  "update request handled", sha=sha)
+        except Exception:
+            pass
+        self._update_etag = None
+
+        if self._notify:
+            self._notify(started, f"force update: {message}")
+
+        if started and self._on_force_update:
+            # An update is staged and this process needs to exit so the
+            # swapper can replace the exe. Let the App decide how (it owns
+            # the tray/other threads) rather than calling os._exit() here.
+            self._on_force_update()

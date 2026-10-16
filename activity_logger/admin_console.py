@@ -705,6 +705,10 @@ class AdminConsole(ttk.Window):
         except Exception:
             file_request = None
         try:
+            update_request, _ = data_backend.get_json(token, f"update_requests/{mid}.json")
+        except Exception:
+            update_request = None
+        try:
             labels, labels_sha = data_backend.get_json(token, LABELS_PATH)
             labels = labels or {}
         except Exception:
@@ -716,20 +720,22 @@ class AdminConsole(ttk.Window):
         except Exception:
             names = []
         self._ui_queue.put(lambda: self._render_machine_details(
-            token, mid, hostname, request, file_request, labels, labels_sha, names, win))
+            token, mid, hostname, request, file_request, update_request,
+            labels, labels_sha, names, win))
 
     def _render_machine_details(self, token, mid, hostname, request, file_request,
-                                labels, labels_sha, names, win=None):
+                                update_request, labels, labels_sha, names, win=None):
         self._status("Ready")
         if win is None or not win.winfo_exists():
             win = ttk.Toplevel(title=f"Machine details — {hostname}")
-            win.geometry("720x860")
-            win.minsize(680, 580)
+            win.geometry("720x900")
+            win.minsize(680, 600)
             self._build_machine_details_widgets(win, token, mid, hostname)
         win.labels_sha = labels_sha
         win.var_owner.set(labels.get(mid, {}).get("owner", ""))
         self._fill_request_section(win, token, mid, hostname, request)
         self._fill_file_request_section(win, token, mid, hostname, file_request)
+        self._fill_update_section(win, token, mid, hostname, update_request)
         self._fill_logs_section(win, token, mid, names)
         self._fill_last_download_section(win, mid)
 
@@ -774,6 +780,16 @@ class AdminConsole(ttk.Window):
                  bootstyle=SECONDARY).pack(anchor=W, pady=(4, 0))
         win.file_status_box = ttk.Frame(win.file_request_frame)
         win.file_status_box.pack(fill=X, pady=(6, 0))
+
+        win.update_frame = ttk.Labelframe(
+            win, text="Force update  —  check for and apply a new version now",
+            bootstyle=INFO, padding=10)
+        win.update_frame.pack(fill=X, padx=14, pady=(0, 8))
+        ttk.Button(win.update_frame, text="Force update now", bootstyle=INFO,
+                  command=lambda: self._details_force_update(win, token, mid, hostname)
+                  ).pack(anchor=W)
+        win.update_status_box = ttk.Frame(win.update_frame)
+        win.update_status_box.pack(fill=X, pady=(6, 0))
 
         win.download_frame = ttk.Labelframe(win, text="Last downloaded on this computer",
                                             bootstyle=INFO, padding=10)
@@ -927,6 +943,48 @@ class AdminConsole(ttk.Window):
                 self._ui_queue.put(lambda: self._status(f"Cancel failed: {exc}"))
                 return
             self._ui_queue.put(lambda: self._status("File request cancelled."))
+            self._machine_details_worker(token, mid, hostname, win)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _fill_update_section(self, win, token, mid, hostname, request) -> None:
+        for child in win.update_status_box.winfo_children():
+            child.destroy()
+
+        if not request:
+            return  # nothing requested yet — just the button stays
+
+        status = request.get("status", "pending")
+        if status == "done":
+            ttk.Label(win.update_status_box,
+                     text=f"{request.get('result', '?')}\n"
+                          f"checked {_relative_time(request.get('completed_at', ''))}",
+                     wraplength=480).pack(anchor=W)
+        else:
+            ttk.Label(win.update_status_box,
+                     text=f"⏳ Checking — requested "
+                          f"{_relative_time(request.get('requested_at', ''))}",
+                     wraplength=480).pack(anchor=W)
+
+    def _details_force_update(self, win, token, mid, hostname) -> None:
+        self._status(f"Requesting an update check on {hostname}...")
+
+        def work():
+            body = {
+                "action": "force_update",
+                "status": "pending",
+                "requested_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            try:
+                data_backend.put_json_retrying(token, f"update_requests/{mid}.json", body,
+                                               f"force update on {hostname}")
+            except Exception as exc:
+                self._ui_queue.put(lambda: self._status(f"Request failed: {exc}"))
+                return
+            self._ui_queue.put(lambda: self._status(
+                f"Requested — {hostname} will check within ~15-20 sec (if online). "
+                f"If an update is found it restarts automatically; use Refresh to see "
+                f"the result."))
             self._machine_details_worker(token, mid, hostname, win)
 
         threading.Thread(target=work, daemon=True).start()
