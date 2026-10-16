@@ -12,6 +12,7 @@ Two pieces run as background threads and push Event objects onto a shared queue:
 """
 
 import ctypes
+import os
 import queue
 import threading
 import time
@@ -47,55 +48,102 @@ def idle_seconds() -> float:
     return max(0.0, millis / 1000.0)
 
 
-def foreground_window() -> tuple[str, str]:
-    """Return (process_name, window_title) of the focused window."""
+def foreground_window() -> tuple[str, str, int]:
+    """Return (process_name, window_title, pid) of the focused window."""
     hwnd = win32gui.GetForegroundWindow()
     if not hwnd:
-        return "", ""
+        return "", "", 0
     try:
         title = win32gui.GetWindowText(hwnd)
     except Exception:
         title = ""
     proc = ""
+    pid = 0
     try:
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         if pid:
             proc = psutil.Process(pid).name()
     except Exception:
         proc = ""
-    return proc, title
+    return proc, title, pid
 
 
-def foreground_window_path(app: str) -> str:
+# A whitelist of extensions, not a blacklist of system paths: apps keep all
+# sorts of internal bookkeeping files open that look nothing like system
+# paths but aren't the user's document either -- e.g. the Windows 11 Store
+# Notepad holds a handle on its own session file under
+# AppData\Local\Packages\...\TabState\<guid>.bin, not on the .txt it's
+# showing. Matching on "this looks like a real document" is far more
+# reliable than trying to list every app's private-storage location.
+_DOCUMENT_EXTENSIONS = {
+    ".txt", ".md", ".rtf", ".csv", ".tsv",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".odt", ".ods", ".odp",
+    ".json", ".xml", ".yaml", ".yml", ".ini", ".cfg", ".toml",
+    ".py", ".js", ".ts", ".java", ".c", ".cpp", ".h", ".cs", ".go", ".rb", ".php", ".sql", ".html", ".css",
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp",
+    ".mp3", ".wav", ".mp4", ".avi", ".mkv", ".mov",
+    ".zip", ".rar", ".7z",
+    ".psd", ".ai", ".dwg",
+}
+
+
+def _likely_document_path(pid: int) -> str:
+    """Best-effort "what file is open" via the process's own file handles.
+
+    There is no general Windows API for "what document is this app
+    displaying" -- each app tracks it differently (if at all). Most apps
+    that are actively showing a document (Word, Excel, Notepad, a PDF
+    viewer, ...) keep a file handle open on it the whole time, so scanning
+    the foreground process's open files for one whose extension looks like
+    a real document is a reasonable generic fallback. It can miss cases
+    (e.g. an app that reads a file fully into memory and closes the
+    handle) or guess wrong if several real candidates are open at once --
+    acceptable for an activity log, not meant to be exact.
+    """
+    try:
+        proc = psutil.Process(pid)
+        for f in proc.open_files():
+            path = f.path
+            _, ext = os.path.splitext(path)
+            if ext.lower() in _DOCUMENT_EXTENSIONS:
+                return path
+    except Exception:
+        pass
+    return ""
+
+
+def foreground_window_path(app: str, pid: int = 0) -> str:
     """Best-effort "what file/folder is open" for the current foreground app.
 
-    There is no general Windows API for this — each app stores it
-    differently (if at all). The one case we CAN resolve reliably is File
-    Explorer, via the Shell.Application COM automation object, which lists
-    every open Explorer window with its real filesystem path. Everything
-    else returns "" (the window title, already logged separately, is often
-    the next best hint for apps that put a filename in their title bar).
+    File Explorer is resolved precisely via the Shell.Application COM
+    automation object, which lists every open Explorer window with its real
+    filesystem path. Everything else falls back to _likely_document_path()
+    (the process's own open file handles) -- less exact, but far more
+    useful than always returning "" for every non-Explorer app.
 
     Must be called from a thread where COM has been initialized
     (pythoncom.CoInitialize()) — see Poller.run().
     """
-    if app.lower() != "explorer.exe":
-        return ""
-    hwnd = win32gui.GetForegroundWindow()
-    if not hwnd:
-        return ""
-    try:
-        shell = win32com.client.Dispatch("Shell.Application")
-        for window in shell.Windows():
-            try:
-                if window.HWND != hwnd:
+    if app.lower() == "explorer.exe":
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        try:
+            shell = win32com.client.Dispatch("Shell.Application")
+            for window in shell.Windows():
+                try:
+                    if window.HWND != hwnd:
+                        continue
+                    folder = window.Document.Folder.Self.Path
+                    return folder or ""
+                except Exception:
                     continue
-                folder = window.Document.Folder.Self.Path
-                return folder or ""
-            except Exception:
-                continue
-    except Exception:
-        pass
+        except Exception:
+            pass
+        return ""
+
+    if pid:
+        return _likely_document_path(pid)
     return ""
 
 
@@ -136,8 +184,8 @@ class Poller(threading.Thread):
 
     def _run(self) -> None:
         # Seed with the current window so the first real change has a duration.
-        self._cur_app, self._cur_title = foreground_window()
-        self._cur_path = foreground_window_path(self._cur_app)
+        self._cur_app, self._cur_title, pid = foreground_window()
+        self._cur_path = foreground_window_path(self._cur_app, pid)
         self._seg_start = time.monotonic()
         self._have_segment = True
 
@@ -165,19 +213,19 @@ class Poller(threading.Thread):
                 self._emit(Event("Idle", detail="idle period", duration=idle_duration))
             self._is_idle = False
             # Start a fresh window segment on resume.
-            self._cur_app, self._cur_title = foreground_window()
-            self._cur_path = foreground_window_path(self._cur_app)
+            self._cur_app, self._cur_title, pid = foreground_window()
+            self._cur_path = foreground_window_path(self._cur_app, pid)
             self._seg_start = time.monotonic()
             self._have_segment = True
             if self._settings.track_idle:
                 self._emit(Event("Active", self._cur_app, self._cur_title))
             return
 
-        app, title = foreground_window()
+        app, title, pid = foreground_window()
         if app != self._cur_app or title != self._cur_title:
             self._close_segment()
             self._cur_app, self._cur_title = app, title
-            self._cur_path = foreground_window_path(app)
+            self._cur_path = foreground_window_path(app, pid)
             self._seg_start = time.monotonic()
             self._have_segment = True
 
