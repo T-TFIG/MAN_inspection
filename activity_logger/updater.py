@@ -228,20 +228,6 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
         "  goto trymove\r\n"
         ")\r\n"
         ":relaunch\r\n"
-        # A real-world detection confirmed Windows Defender actively
-        # quarantines/scans things tied to this update mechanism on some
-        # machines (its heuristics flag the download-and-run pattern), and
-        # a plain delay before launching (tried first) wasn't reliable
-        # enough -- a fixed wait is a guess at how long a scan takes, and
-        # still lost the race on a real machine. Forcing a full synchronous
-        # read of the file via `certutil -hashfile` triggers Windows'
-        # on-access AV scan deterministically right here, during a step we
-        # fully control and retry around -- not during the actual launch,
-        # where a scan-in-progress lock reliably produces "Failed to load
-        # Python DLL". If antivirus is going to intervene, this makes it
-        # happen now instead of during the exec attempt.
-        f'certutil -hashfile "{cur_path}" SHA256 >NUL 2>&1\r\n'
-        "ping -n 2 127.0.0.1 >NUL\r\n"
         f'start "" "{cur_path}" --post-update\r\n'
         'del "%~f0"\r\n'
     )
@@ -265,6 +251,8 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
     vbs = (
         'Set shell = CreateObject("WScript.Shell")\r\n'
         f'shell.Run "cmd /c ""{bat_path}""", 0, False\r\n'
+        'On Error Resume Next\r\n'
+        'CreateObject("Scripting.FileSystemObject").DeleteFile WScript.ScriptFullName\r\n'
     )
     vfd, vbs_path = tempfile.mkstemp(suffix="_update.vbs")
     with os.fdopen(vfd, "w", encoding="ascii") as fh:
@@ -276,7 +264,37 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
     startupinfo.wShowWindow = subprocess.SW_HIDE
     subprocess.Popen(["wscript.exe", "//B", "//Nologo", vbs_path],
                      creationflags=creationflags, startupinfo=startupinfo,
-                     close_fds=True)
+                     env=_clean_child_env(), close_fds=True)
+
+
+def _clean_child_env() -> dict:
+    """Our environment minus PyInstaller's onefile bookkeeping, for the relaunch.
+
+    The frozen exe's bootloader sets _PYI_APPLICATION_HOME_DIR (this process's
+    _MEIxxxx unpack folder), _PYI_ARCHIVE_FILE (our exe's path) and
+    _PYI_PARENT_PROCESS_LEVEL. Inherited through wscript -> cmd -> start,
+    they reach the relaunched exe; because the swap puts it at the SAME
+    path as _PYI_ARCHIVE_FILE, its bootloader takes them at face value,
+    assumes it's the child half of an already-unpacked process, and tries
+    to load python3xx.dll from our _MEI folder -- which was deleted when
+    we exited. That is the "Failed to load Python DLL ... _MEIxxxx" crash
+    after every self-update (reproduced exactly: same exe, inherited vars
+    -> exits -1; vars stripped -> starts normally). Launching the exe by
+    hand never showed it because a fresh shell has none of these vars.
+    """
+    meipass = (getattr(sys, "_MEIPASS", "") or "").lower()
+    env = {}
+    for key, value in os.environ.items():
+        if key.upper().startswith("_PYI_") or key.upper() == "_MEIPASS2":
+            continue
+        if meipass and meipass in value.lower():
+            if key.upper() != "PATH":
+                continue  # e.g. TCL_LIBRARY/TK_LIBRARY pointing into our _MEI
+            value = os.pathsep.join(p for p in value.split(os.pathsep)
+                                    if meipass not in p.lower())
+        env[key] = value
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
 
 
 def was_just_relaunched_from_update() -> bool:
