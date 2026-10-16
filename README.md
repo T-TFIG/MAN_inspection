@@ -91,6 +91,12 @@ build.bat
 > วินิจฉัยได้เร็วสุด (`irm .../deploy/diagnose.ps1 | iex`) ถ้าเจอให้รัน [deploy/install.ps1](deploy/install.ps1)
 > ซ้ำ (เลี่ยงกลไก self-update ที่ค้าง โหลดผ่าน PowerShell ตรงแทน)
 
+> **ถ้าเจอ error "API rate limit exceeded for \<IP\>"** ตอนรัน `install.ps1` หรือเช็กอัปเดต:
+> แก้แล้วใน v0.4.2 — เดิมใช้ `api.github.com` ซึ่งจำกัด **60 ครั้ง/ชม. ต่อ 1 IP** (ทุกเครื่องในออฟฟิศ
+> ที่แชร์ IP สาธารณะเดียวกัน ใช้โควต้าร่วมกันหมด เครื่องเยอะ+เช็กถี่ก็หมดโควต้าได้ง่าย) เปลี่ยนมาใช้
+> URL แบบ redirect ของ GitHub (`github.com/.../releases/latest/download/<ไฟล์>`) แทน ซึ่งไม่โดน
+> limit นี้เลย — อัปเดตเป็น v0.4.2 ขึ้นไปแล้วจะไม่เจอปัญหานี้อีก
+
 ## Admin Console — dashboard + ตั้งค่าส่วนกลาง
 
 หน้าตาใช้ธีม modern flat (ttkbootstrap) ปรับขนาดหน้าต่างได้ แท็บ Policy เลื่อน scroll ได้ถ้าเนื้อหายาวกว่าจอ

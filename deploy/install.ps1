@@ -33,19 +33,20 @@ $ErrorActionPreference = "Stop"
 $InstallDir = "$env:ProgramData\MAN_inspection\app"
 $TargetExe  = Join-Path $InstallDir "MAN_inspection.exe"
 $TaskName   = "MAN_inspection Activity Logger"
-$ReleaseApi = "https://api.github.com/repos/T-TFIG/MAN_inspection/releases/latest"
+# A direct download, not the api.github.com JSON lookup: that REST endpoint
+# rate-limits unauthenticated requests to 60/hour PER IP ADDRESS, which an
+# office full of machines sharing one public IP can exhaust easily (this is
+# exactly the error this script used to hit: "API rate limit exceeded for
+# <office IP>"). This URL redirects through github.com itself (not the API
+# host) straight to whatever the current latest release's asset is, so it
+# isn't subject to that cap at all.
+$LatestDownloadUrl = "https://github.com/T-TFIG/MAN_inspection/releases/latest/download/MAN_inspection.exe"
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
 if (-not $ExePath) {
-    Write-Host "Fetching latest release info..."
-    $release = Invoke-RestMethod -Uri $ReleaseApi -Headers @{ "User-Agent" = "MAN_inspection-installer" }
-    $asset = $release.assets | Where-Object { $_.name -eq "MAN_inspection.exe" }
-    if (-not $asset) {
-        throw "Could not find MAN_inspection.exe in the latest release ($($release.tag_name))."
-    }
-    Write-Host "Downloading $($release.tag_name)..."
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $TargetExe
+    Write-Host "Downloading the latest release..."
+    Invoke-WebRequest -Uri $LatestDownloadUrl -OutFile $TargetExe
 } else {
     if (-not (Test-Path $ExePath)) { throw "ExePath not found: $ExePath" }
     Copy-Item -Path $ExePath -Destination $TargetExe -Force

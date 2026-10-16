@@ -1,12 +1,26 @@
 """Self-update from GitHub Releases.
 
-When running as the built .exe, we ask the GitHub API for the latest release of
-the configured repo. If its version is newer than the running one, we download
-the new .exe next to the current one and hand control to a small batch script
-that waits for us to exit, swaps the file, and relaunches.
+When running as the built .exe, we check the latest release of the configured
+repo. If its version is newer than the running one, we download the new .exe
+next to the current one and hand control to a small batch script that waits
+for us to exit, swaps the file, and relaunches.
+
+Version checks deliberately avoid the GitHub REST API (api.github.com), which
+rate-limits unauthenticated requests to 60/hour **per IP address** — every
+machine behind one office's shared public IP draws from the same pool, and
+with each machine checking at startup, every 6h, and whenever the admin
+console refreshes its dashboard, that budget is easy to exhaust (this is
+exactly what happened in testing: "API rate limit exceeded for <office IP>").
+Instead we use GitHub's stable release-asset redirect URL
+(github.com/<owner>/<repo>/releases/latest/download/<asset>), which resolves
+through github.com itself — not the API host — and isn't subject to that
+60/hour cap. One HEAD request reads the redirect's Location header, which
+already contains the release tag (".../releases/download/v1.2.3/<asset>"),
+so this gets us the version AND a working download URL in a single request.
 """
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,8 +30,6 @@ import requests
 from packaging.version import InvalidVersion, Version
 
 from . import __version__, config
-
-_API = "https://api.github.com/repos/{owner}/{repo}/releases/latest"
 
 
 def _is_frozen() -> bool:
@@ -37,25 +49,28 @@ def _latest_release(asset_name: str = config.RELEASE_ASSET_NAME) -> tuple[object
 
     Both the employee logger and the admin console self-update from the same
     Release; each passes its own asset name (default is the employee one, for
-    existing callers).
+    existing callers). See the module docstring for why this doesn't call
+    api.github.com.
     """
-    url = _API.format(owner=config.GITHUB_OWNER, repo=config.GITHUB_REPO)
+    url = (f"https://github.com/{config.GITHUB_OWNER}/{config.GITHUB_REPO}"
+          f"/releases/latest/download/{asset_name}")
     try:
-        resp = requests.get(url, timeout=15,
-                            headers={"Accept": "application/vnd.github+json"})
-        resp.raise_for_status()
-        data = resp.json()
+        resp = requests.head(url, timeout=15, allow_redirects=False)
+        location = resp.headers.get("Location", "")
     except Exception:
         return None
 
-    version = _parse(data.get("tag_name", ""))
+    match = re.search(r"/releases/download/v?([^/]+)/", location)
+    if not match:
+        return None
+    version = _parse(match.group(1))
     if version is None:
         return None
-
-    for asset in data.get("assets", []):
-        if asset.get("name") == asset_name:
-            return version, asset.get("browser_download_url", "")
-    return None
+    # `url` itself (not `location`) is the download URL to use: it always
+    # redirects to whatever the current latest release is, which also means
+    # check_and_update() downloads the actual latest build even if a newer
+    # one shipped in the few seconds since this check.
+    return version, url
 
 
 def check_and_update(asset_name: str = config.RELEASE_ASSET_NAME) -> bool:
