@@ -328,7 +328,9 @@ class AdminConsole(ttk.Window):
                                           command=self._request_log_now)
         self.btn_request_log.pack(side=LEFT, padx=(0, 6))
         ttk.Button(btns, text="Machine details…", bootstyle=SECONDARY,
-                  command=self._open_machine_details).pack(side=LEFT)
+                  command=self._open_machine_details).pack(side=LEFT, padx=(0, 6))
+        ttk.Button(btns, text="Delete machine…", bootstyle=(DANGER, OUTLINE),
+                  command=self._delete_machine).pack(side=LEFT)
 
         ttk.Label(tab, textvariable=self.var_summary, bootstyle=SECONDARY,
                   font=("Segoe UI", 10)).pack(anchor=W, pady=(0, 6))
@@ -710,6 +712,112 @@ class AdminConsole(ttk.Window):
                 if idx < len(values):
                     values[idx] = owner
                     self.tree.item(mid, values=values)
+
+    # -- delete machine (status, requests, label, and all uploaded logs) --
+    def _delete_machine(self) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Select a machine", "Select a row in the table first.")
+            return
+        token = self._require_token()
+        if not token:
+            return
+        mid = sel[0]
+        hostname = self._machines.get(mid, {}).get("hostname", mid)
+
+        win = ttk.Toplevel(title="Delete machine")
+        win.geometry("440x260")
+        win.minsize(440, 260)
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill=BOTH, expand=True)
+        ttk.Label(frame, text=f"Delete {hostname}?", font=("Segoe UI", 12, "bold"),
+                 bootstyle=DANGER).pack(anchor=W)
+        ttk.Label(frame, wraplength=400, bootstyle=SECONDARY, text=(
+            "Permanently removes this machine's status, assigned-to label, "
+            "pending requests, and ALL uploaded logs from the data repo. "
+            "This cannot be undone. It does NOT stop the machine itself from "
+            "running or reporting back in -- it'll just show up again at its "
+            "next heartbeat, as a fresh entry with no history (uninstall "
+            "separately on the machine if you want it to stop entirely)."
+        )).pack(anchor=W, pady=(6, 10))
+        ttk.Label(frame, text=f'Type the hostname to confirm ("{hostname}"):').pack(anchor=W)
+        var_confirm = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=var_confirm)
+        entry.pack(fill=X, pady=(4, 10))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=X)
+        btn_delete = ttk.Button(
+            btn_row, text="Delete permanently", bootstyle=DANGER, state="disabled",
+            command=lambda: self._delete_machine_confirmed(win, token, mid, hostname))
+        btn_delete.pack(side=LEFT, padx=(0, 6))
+        ttk.Button(btn_row, text="Cancel", bootstyle=SECONDARY,
+                  command=win.destroy).pack(side=LEFT)
+
+        def _check(*_args):
+            btn_delete.configure(state="normal" if var_confirm.get() == hostname else "disabled")
+        var_confirm.trace_add("write", _check)
+        entry.focus_set()
+
+    def _delete_machine_confirmed(self, win, token, mid, hostname) -> None:
+        win.destroy()
+        self._status(f"Deleting {hostname}...")
+        threading.Thread(target=self._delete_machine_worker,
+                         args=(token, mid, hostname), daemon=True).start()
+
+    def _delete_machine_worker(self, token, mid, hostname) -> None:
+        errors = []
+
+        def _try_delete(path):
+            try:
+                _, sha = data_backend.get_file(token, path)
+                if sha:
+                    data_backend.delete_file(token, path, sha,
+                                             f"delete machine {hostname} ({mid})")
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+
+        for p in (f"status/{mid}.json", f"requests/{mid}.json",
+                 f"file_requests/{mid}.json", f"update_requests/{mid}.json"):
+            _try_delete(p)
+
+        try:
+            entries = data_backend.list_dir(token, f"logs/{mid}")
+            for e in entries:
+                if e.get("name", "").startswith("."):
+                    continue
+                try:
+                    data_backend.delete_file(token, e["path"], e["sha"],
+                                             f"delete machine {hostname} ({mid}) logs")
+                except Exception as exc:
+                    errors.append(f"{e['path']}: {exc}")
+        except Exception:
+            pass  # no logs directory for this machine -- nothing to clean up
+
+        try:
+            labels, labels_sha = data_backend.get_json(token, LABELS_PATH)
+            if labels and mid in labels:
+                del labels[mid]
+                data_backend.put_json_retrying(token, LABELS_PATH, labels,
+                                               f"remove label for deleted machine {mid}",
+                                               cached_sha=labels_sha)
+        except Exception as exc:
+            errors.append(f"label: {exc}")
+
+        self._machines.pop(mid, None)
+        self._ui_queue.put(lambda: self._after_delete_machine(mid, hostname, errors))
+
+    def _after_delete_machine(self, mid, hostname, errors) -> None:
+        if self.tree.exists(mid):
+            self.tree.delete(mid)
+        if errors:
+            self._status(f"Deleted {hostname} with some errors")
+            messagebox.showwarning(
+                "Partially deleted",
+                f"{hostname} was mostly removed, but some parts failed:\n\n"
+                + "\n".join(errors))
+        else:
+            self._status(f"Deleted {hostname}.")
 
     # -- machine details dialog (status, pending/cancel, download, history) --
     def _open_machine_details(self) -> None:
