@@ -74,6 +74,12 @@ build.bat
 
 ปรับ owner/repo ได้ที่ [activity_logger/config.py](activity_logger/config.py)
 
+> **ถ้าเครื่องไหน "เปิดไม่ขึ้นเลย"** ทั้งที่ Scheduled Task รันสำเร็จ (0x0): อาการนี้เคยเกิดจาก
+> กลไก self-update เองค้าง (แก้แล้วใน v0.3.8) — เช็ก `C:\ProgramData\MAN_inspection\app\` ว่ามีไฟล์
+> `MAN_inspection.exe.new` หรือ `%TEMP%\*_update.bat` ค้างอยู่ไหม ใช้ [deploy/diagnose.ps1](deploy/diagnose.ps1)
+> วินิจฉัยได้เร็วสุด (`irm .../deploy/diagnose.ps1 | iex`) ถ้าเจอให้รัน [deploy/install.ps1](deploy/install.ps1)
+> ซ้ำ (เลี่ยงกลไก self-update ที่ค้าง โหลดผ่าน PowerShell ตรงแทน)
+
 ## Admin Console — dashboard + ตั้งค่าส่วนกลาง
 
 หน้าตาใช้ธีม modern flat (ttkbootstrap) ปรับขนาดหน้าต่างได้ แท็บ Policy เลื่อน scroll ได้ถ้าเนื้อหายาวกว่าจอ

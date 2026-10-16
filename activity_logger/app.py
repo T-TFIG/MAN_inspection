@@ -45,6 +45,13 @@ class App:
                 return
         except Exception:
             pass
+        # We're proceeding with a normal startup (no update in flight from
+        # THIS launch) — safe to sweep up any stuck swapper scripts from a
+        # past attempt that never finished.
+        try:
+            updater.cleanup_stale_update_scripts()
+        except Exception:
+            pass
 
         self._writer.start()
         self._poller.start()

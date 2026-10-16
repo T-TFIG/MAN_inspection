@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 import requests
 from packaging.version import InvalidVersion, Version
@@ -83,7 +84,7 @@ def check_and_update() -> bool:
         _cleanup(new_path)
         return False
 
-    _spawn_swapper(os.getpid(), new_path, exe_path)
+    _spawn_swapper(new_path, exe_path)
     return True
 
 
@@ -115,16 +116,35 @@ def check_now() -> tuple[bool, str]:
     return False, f"Update v{version} found, but the download failed. Try again later."
 
 
-def _spawn_swapper(pid: int, new_path: str, cur_path: str) -> None:
+def _spawn_swapper(new_path: str, cur_path: str) -> None:
+    """Write + launch the batch script that does the actual file swap.
+
+    Earlier version waited for our PID to disappear from `tasklist` before
+    moving the file, in a loop with no timeout. That hung forever on at
+    least one real machine — almost certainly PID reuse (Windows handed our
+    just-freed PID to an unrelated process, so the "has it exited?" check
+    kept seeing a match) — leaving a `.new` file + a stuck batch script and
+    the app never coming back up. No PID wait now: our process does no slow
+    cleanup before exiting, so a short fixed delay is enough in the normal
+    case; `move` is retried a bounded number of times for the rare case of a
+    transient lock (e.g. antivirus briefly scanning the fresh download), and
+    the script relaunches the app and deletes itself either way — even if
+    the move itself never succeeds, the app comes back up instead of the
+    whole thing hanging silently.
+    """
     batch = (
         "@echo off\r\n"
-        ":wait\r\n"
-        f'tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL\r\n'
-        "if not errorlevel 1 (\r\n"
+        "ping -n 3 127.0.0.1 >NUL\r\n"
+        "set \"tries=0\"\r\n"
+        ":trymove\r\n"
+        f'move /Y "{new_path}" "{cur_path}" >NUL 2>&1\r\n'
+        "if errorlevel 1 (\r\n"
+        "  set /a tries+=1\r\n"
+        "  if %tries% GEQ 10 goto relaunch\r\n"
         "  ping -n 2 127.0.0.1 >NUL\r\n"
-        "  goto wait\r\n"
+        "  goto trymove\r\n"
         ")\r\n"
-        f'move /Y "{new_path}" "{cur_path}" >NUL\r\n'
+        ":relaunch\r\n"
         f'start "" "{cur_path}"\r\n'
         'del "%~f0"\r\n'
     )
@@ -134,6 +154,29 @@ def _spawn_swapper(pid: int, new_path: str, cur_path: str) -> None:
     creationflags = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
     subprocess.Popen(["cmd", "/c", path], creationflags=creationflags,
                      close_fds=True)
+
+
+def cleanup_stale_update_scripts() -> None:
+    """Best-effort sweep of leftover *_update.bat files from past attempts.
+
+    Call once at normal startup (after we know we're NOT mid-update). Only
+    removes files old enough (10+ minutes) that they cannot be a swap that's
+    still legitimately in progress.
+    """
+    try:
+        tmp_dir = tempfile.gettempdir()
+        cutoff = time.time() - 600
+        for name in os.listdir(tmp_dir):
+            if not name.endswith("_update.bat"):
+                continue
+            path = os.path.join(tmp_dir, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def _cleanup(path: str) -> None:
