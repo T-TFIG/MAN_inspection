@@ -167,7 +167,12 @@ def check_and_update(asset_name: str = config.RELEASE_ASSET_NAME) -> bool:
         _cleanup(new_path)
         return False
 
-    _spawn_swapper(new_path, exe_path)
+    # Only report "update started" (which makes the caller exit) once the
+    # swapper has proven it is actually running. Otherwise we'd kill the
+    # app and nothing would ever swap the file or relaunch it.
+    if not _spawn_swapper(new_path, exe_path):
+        _cleanup(new_path)
+        return False
     return True
 
 
@@ -196,10 +201,20 @@ def check_now(asset_name: str = config.RELEASE_ASSET_NAME) -> tuple[bool, str]:
 
     if check_and_update(asset_name):
         return True, f"Updating to v{version} — the app will restart shortly."
-    return False, f"Update v{version} found, but the download failed. Try again later."
+    return False, (f"Update v{version} found, but it could not be downloaded or "
+                   f"applied. Try again later.")
 
 
-def _spawn_swapper(new_path: str, cur_path: str) -> None:
+def _wait_for_marker(path: str, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.25)
+    return os.path.exists(path)
+
+
+def _spawn_swapper(new_path: str, cur_path: str) -> bool:
     """Write + launch the batch script that does the actual file swap.
 
     Earlier version waited for our PID to disappear from `tasklist` before
@@ -215,8 +230,12 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
     the move itself never succeeds, the app comes back up instead of the
     whole thing hanging silently.
     """
+    fd, bat_path = tempfile.mkstemp(suffix="_update.bat")
+    marker = bat_path + ".started"
     batch = (
         "@echo off\r\n"
+        # Proof-of-life for the parent: it won't exit until this exists.
+        f'echo 1>"{marker}"\r\n'
         "ping -n 3 127.0.0.1 >NUL\r\n"
         "set \"tries=0\"\r\n"
         ":trymove\r\n"
@@ -229,25 +248,17 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
         ")\r\n"
         ":relaunch\r\n"
         f'start "" "{cur_path}" --post-update\r\n'
+        f'del "{marker}" >NUL 2>&1\r\n'
         'del "%~f0"\r\n'
     )
-    fd, bat_path = tempfile.mkstemp(suffix="_update.bat")
     with os.fdopen(fd, "w", encoding="ascii") as fh:
         fh.write(batch)
 
-    # Launch the batch through a VBScript run via wscript.exe instead of
-    # invoking cmd.exe directly. CREATE_NO_WINDOW + STARTUPINFO/SW_HIDE
-    # (Win32-level flags on the cmd.exe process) were still reported to
-    # flash a visible console on a real machine -- Windows 11's default
-    # Windows Terminal console host can intercept a newly spawned console
-    # process into a new tab under some configurations regardless of
-    # those flags, since it manages console allocation itself.
-    # wscript.exe has no console subsystem at all (it's a plain Win32 GUI
-    # app), so there is nothing console-related for any terminal host to
-    # intercept; WScript.Shell.Run's window-style argument (0 = hidden)
-    # is a COM-level directive, a completely different mechanism, and is
-    # the standard bulletproof technique for a batch script that must
-    # never show a window under any console-host configuration.
+    # Preferred launcher: the batch through a VBScript run via wscript.exe.
+    # CREATE_NO_WINDOW + STARTUPINFO/SW_HIDE on cmd.exe still flashed a
+    # console on Windows 11 with Windows Terminal as the console host;
+    # wscript.exe has no console at all and WScript.Shell.Run(..., 0)
+    # hides the batch, so nothing is left for a terminal host to show.
     vbs = (
         'Set shell = CreateObject("WScript.Shell")\r\n'
         f'shell.Run "cmd /c ""{bat_path}""", 0, False\r\n'
@@ -262,9 +273,35 @@ def _spawn_swapper(new_path: str, cur_path: str) -> None:
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
-    subprocess.Popen(["wscript.exe", "//B", "//Nologo", vbs_path],
-                     creationflags=creationflags, startupinfo=startupinfo,
-                     env=_clean_child_env(), close_fds=True)
+    env = _clean_child_env()
+
+    try:
+        subprocess.Popen(["wscript.exe", "//B", "//Nologo", vbs_path],
+                         creationflags=creationflags, startupinfo=startupinfo,
+                         env=env, close_fds=True)
+    except Exception:
+        pass
+    if _wait_for_marker(marker, 8):
+        return True
+
+    # wscript.exe can be disabled/blocked (Windows version, group policy,
+    # security software) and then fails silently: the script never runs.
+    # Without this check the app would exit anyway, leaving nothing to swap
+    # the file or relaunch it. Run the same batch via a hidden cmd instead.
+    try:
+        subprocess.Popen(["cmd", "/c", bat_path], creationflags=creationflags,
+                         startupinfo=startupinfo, env=env, close_fds=True)
+    except Exception:
+        pass
+    if _wait_for_marker(marker, 8):
+        _cleanup(vbs_path)  # the blocked VBScript never got to delete itself
+        return True
+
+    # Neither launcher worked: give up cleanly so the caller keeps running
+    # instead of exiting into the void.
+    for leftover in (bat_path, vbs_path, marker):
+        _cleanup(leftover)
+    return False
 
 
 def _clean_child_env() -> dict:
