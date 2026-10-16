@@ -32,8 +32,13 @@ def _parse(tag: str):
         return None
 
 
-def _latest_release() -> tuple[object, str] | None:
-    """Return (Version, download_url) for the latest release, or None."""
+def _latest_release(asset_name: str = config.RELEASE_ASSET_NAME) -> tuple[object, str] | None:
+    """Return (Version, download_url) for the latest release's ``asset_name``.
+
+    Both the employee logger and the admin console self-update from the same
+    Release; each passes its own asset name (default is the employee one, for
+    existing callers).
+    """
     url = _API.format(owner=config.GITHUB_OWNER, repo=config.GITHUB_REPO)
     try:
         resp = requests.get(url, timeout=15,
@@ -48,17 +53,17 @@ def _latest_release() -> tuple[object, str] | None:
         return None
 
     for asset in data.get("assets", []):
-        if asset.get("name") == config.RELEASE_ASSET_NAME:
+        if asset.get("name") == asset_name:
             return version, asset.get("browser_download_url", "")
     return None
 
 
-def check_and_update() -> bool:
+def check_and_update(asset_name: str = config.RELEASE_ASSET_NAME) -> bool:
     """Returns True if an update was started (caller should then exit)."""
     if not _is_frozen():
         return False
 
-    latest = _latest_release()
+    latest = _latest_release(asset_name)
     if not latest:
         return False
     version, download_url = latest
@@ -88,14 +93,14 @@ def check_and_update() -> bool:
     return True
 
 
-def check_now() -> tuple[bool, str]:
+def check_now(asset_name: str = config.RELEASE_ASSET_NAME) -> tuple[bool, str]:
     """Manual, user-triggered check (e.g. the tray's "Check for updates").
 
     Unlike check_and_update(), this always returns a human-readable reason,
     including "already up to date" and "couldn't reach GitHub" — the silent
     periodic check doesn't need that, but a button someone just clicked does.
     """
-    latest = _latest_release()
+    latest = _latest_release(asset_name)
     if not latest:
         return False, "Could not reach GitHub to check for updates."
     version, download_url = latest
@@ -111,7 +116,7 @@ def check_now() -> tuple[bool, str]:
     if not download_url:
         return False, f"Update v{version} found, but it has no download asset."
 
-    if check_and_update():
+    if check_and_update(asset_name):
         return True, f"Updating to v{version} — the app will restart shortly."
     return False, f"Update v{version} found, but the download failed. Try again later."
 

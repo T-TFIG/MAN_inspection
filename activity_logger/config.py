@@ -7,9 +7,12 @@ import sys
 # The built .exe checks this repo's latest Release and updates itself.
 GITHUB_OWNER = "T-TFIG"
 GITHUB_REPO = "MAN_inspection"
-# Name of the .exe asset attached to each Release (must match the PyInstaller
-# output name in .github/workflows/build.yml).
+# Names of the .exe assets attached to each Release (must match the
+# PyInstaller output names in .github/workflows/build.yml). Both the employee
+# logger and the admin console self-update from the SAME release/version;
+# each just looks for its own asset name.
 RELEASE_ASSET_NAME = "MAN_inspection.exe"
+ADMIN_RELEASE_ASSET_NAME = "MAN_inspection_admin.exe"
 
 # --- Private data backend (policy / machine status / uploaded logs) --------
 # A SEPARATE private repo, holding no source code, used as a lightweight

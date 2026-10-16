@@ -246,6 +246,11 @@ class AdminConsole(ttk.Window):
         except Exception:
             pass
 
+        try:
+            updater.cleanup_stale_update_scripts()
+        except Exception:
+            pass
+
         self._sha = None
         self._machines: dict[str, dict] = {}
 
@@ -262,6 +267,9 @@ class AdminConsole(ttk.Window):
         if self.var_token.get().strip():
             self.after(200, self._load_policy)
             self.after(400, self._refresh_dashboard)
+        # Silent startup update check — same self-update mechanism as the
+        # employee app, just pointed at the admin console's own asset name.
+        self.after(800, self._check_for_updates_startup)
 
     # -- layout --
     def _build(self) -> None:
@@ -275,6 +283,8 @@ class AdminConsole(ttk.Window):
                   ).pack(side=LEFT)
         ttk.Label(title_row, text="  Admin Console", font=("Segoe UI", 16),
                   bootstyle=SECONDARY).pack(side=LEFT)
+        ttk.Button(title_row, text="Check for updates", bootstyle=(SECONDARY, OUTLINE),
+                  command=self._check_for_updates).pack(side=RIGHT)
         ttk.Label(header, text=f"repo: {config.DATA_REPO_OWNER}/{config.DATA_REPO_NAME}",
                   bootstyle=SECONDARY, font=("Segoe UI", 9)).pack(anchor=W, pady=(2, 0))
 
@@ -470,6 +480,44 @@ class AdminConsole(ttk.Window):
             return None
         save_token(token)
         return token
+
+    # -- self-update (admin console's own .exe) --
+    def _check_for_updates_startup(self) -> None:
+        threading.Thread(target=self._update_worker, args=(False,), daemon=True).start()
+
+    def _check_for_updates(self) -> None:
+        self._status("Checking for updates...")
+        threading.Thread(target=self._update_worker, args=(True,), daemon=True).start()
+
+    def _update_worker(self, manual: bool) -> None:
+        try:
+            if manual:
+                started, message = updater.check_now(config.ADMIN_RELEASE_ASSET_NAME)
+            else:
+                started = updater.check_and_update(config.ADMIN_RELEASE_ASSET_NAME)
+                message = "Updating — the app will restart shortly." if started else None
+        except Exception as exc:
+            started, message = False, f"Update check failed: {exc}"
+
+        if started:
+            self._ui_queue.put(lambda: self._begin_update_shutdown(message))
+        elif message:
+            self._ui_queue.put(lambda: self._status(message))
+
+    def _begin_update_shutdown(self, message: str) -> None:
+        self._status(message)
+        # Give the status message a moment to actually be seen before the
+        # window disappears and the swapper takes over.
+        self.after(1500, self._exit_for_update)
+
+    def _exit_for_update(self) -> None:
+        try:
+            self.destroy()
+        finally:
+            # Hard-exit rather than letting Python unwind normally: we want
+            # this process gone immediately so the swapper's "move" step (and
+            # the relaunch that follows) isn't left waiting on anything.
+            os._exit(0)
 
     # -- dashboard --
     def _auto_refresh(self) -> None:
