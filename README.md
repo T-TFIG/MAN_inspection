@@ -402,3 +402,7 @@ irm https://raw.githubusercontent.com/T-TFIG/MAN_inspection/main/deploy/install.
 > สลับไฟล์สำเร็จ ไม่เกี่ยวกับ antivirus (เครื่องนั้นปิด Real-time protection อยู่)
 
 > **v0.4.20:** เวอร์ชันทดสอบการ update จาก v0.4.19 (ไม่มีการเปลี่ยนแปลงฟังก์ชันการทำงาน) ใช้ยืนยันว่า swapper ที่บังคับปิดตัวเก่าที่ค้างทำงานจริงบนเครื่องจริง
+
+> **v0.4.21:** กดปุ่ม Force update / Check for updates ซ้ำภายใน 5 นาทีแล้วถูกปฏิเสธเงียบๆ (ขึ้นว่า
+> "could not be downloaded or applied") — cooldown 5 นาทีมีไว้กัน update **อัตโนมัติ**วนลูปเท่านั้น ตอนนี้การ
+> กดปุ่มเองข้าม cooldown แล้ว ส่วนการเช็กอัตโนมัติยังติด cooldown ตามเดิม

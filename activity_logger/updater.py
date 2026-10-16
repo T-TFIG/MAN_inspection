@@ -108,7 +108,8 @@ def _clear_cooldown(asset_name: str) -> None:
         pass
 
 
-def check_and_update(asset_name: str = config.RELEASE_ASSET_NAME) -> bool:
+def check_and_update(asset_name: str = config.RELEASE_ASSET_NAME,
+                     ignore_cooldown: bool = False) -> bool:
     """Returns True if an update was started (caller should then exit).
 
     If a swap was attempted recently but the running exe still reports the
@@ -138,7 +139,10 @@ def check_and_update(asset_name: str = config.RELEASE_ASSET_NAME) -> bool:
         _clear_cooldown(asset_name)
         return False
 
-    if _recently_attempted(asset_name):
+    # The cooldown only exists to stop AUTOMATIC checks from looping. A
+    # person pressing "Check for updates" / "Force update now" must not be
+    # refused silently because they pressed it twice within 5 minutes.
+    if not ignore_cooldown and _recently_attempted(asset_name):
         return False
     _mark_attempt(asset_name)
 
@@ -199,7 +203,7 @@ def check_now(asset_name: str = config.RELEASE_ASSET_NAME) -> tuple[bool, str]:
     if not download_url:
         return False, f"Update v{version} found, but it has no download asset."
 
-    if check_and_update(asset_name):
+    if check_and_update(asset_name, ignore_cooldown=True):
         return True, f"Updating to v{version} — the app will restart shortly."
     return False, (f"Update v{version} found, but it could not be downloaded or "
                    f"applied. Try again later.")
