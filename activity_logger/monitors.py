@@ -170,7 +170,7 @@ def explorer_window_path(hwnd) -> str:
     return ""
 
 
-def foreground_window_path(app: str, pid: int = 0) -> str:
+def _foreground_window_path_raw(app: str, pid: int = 0) -> str:
     """Best-effort "what file/folder is open" for the current foreground app.
 
     File Explorer is resolved precisely via the Shell.Application COM
@@ -191,6 +191,56 @@ def foreground_window_path(app: str, pid: int = 0) -> str:
     if pid:
         return _likely_document_path(pid)
     return ""
+
+
+_LOOKUP_TIMEOUT_SEC = 2.0
+_lookup_busy = threading.Event()
+
+
+def foreground_window_path(app: str, pid: int = 0) -> str:
+    """_foreground_window_path_raw with a hard time limit.
+
+    The lookup touches things that can block indefinitely (another
+    process's handles, COM calls into Explorer). Run inline, one stuck call
+    froze the whole window logger -- no rows for hours while the machine
+    kept sending heartbeats. Now it runs on a helper thread: if it hasn't
+    answered in a couple of seconds we log the row without a path and move
+    on, and while a stuck call is still outstanding further lookups are
+    skipped rather than piling up more stuck threads.
+    """
+    if _lookup_busy.is_set():
+        return ""
+    result: list = []
+
+    def work():
+        try:
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+        try:
+            result.append(_foreground_window_path_raw(app, pid))
+        except Exception:
+            result.append("")
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+            _lookup_busy.clear()
+
+    _lookup_busy.set()
+    t = threading.Thread(target=work, name="PathLookup", daemon=True)
+    t.start()
+    t.join(_LOOKUP_TIMEOUT_SEC)
+    return result[0] if result else ""
+
+
+def _record_error(msg: str) -> None:
+    try:
+        from .excel_writer import _warn
+        _warn(msg)
+    except Exception:
+        pass
 
 
 # --- poller thread -----------------------------------------------------------
@@ -236,7 +286,13 @@ class Poller(threading.Thread):
         self._have_segment = True
 
         while not self._stop.wait(self._settings.poll_interval_sec):
-            self._tick()
+            try:
+                self._tick()
+            except Exception as exc:
+                # An uncaught error here used to end this thread silently:
+                # logging stopped while the rest of the app (heartbeat, update
+                # checks) carried on looking healthy.
+                _record_error(f"poller tick failed: {type(exc).__name__}: {exc}")
 
         # Flush the final in-progress segment on shutdown.
         self._close_segment()

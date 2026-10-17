@@ -343,6 +343,7 @@ def _range_request_path() -> str:
 
 
 MAX_RANGE_DAYS = 31
+_RANGE_DEADLINE_SEC = 150
 _RANGE_FMT = "%Y-%m-%d %H:%M:%S"
 
 
@@ -674,9 +675,24 @@ class RequestWatcher(threading.Thread):
         if request.get("action") != "log_range":
             return
 
-        ok, message, extra = build_log_range(request.get("start", ""),
-                                             request.get("end", ""),
-                                             bool(request.get("include_windows")))
+        # Build on a helper thread with a deadline: if anything inside hangs,
+        # this watcher must still go on answering every other request (log,
+        # file, update) instead of silently going deaf.
+        outcome: list = []
+
+        def build():
+            try:
+                outcome.append(build_log_range(request.get("start", ""),
+                                               request.get("end", ""),
+                                               bool(request.get("include_windows"))))
+            except Exception as exc:
+                outcome.append((False, f"internal error: {type(exc).__name__}: {exc}", {}))
+
+        worker = threading.Thread(target=build, name="RangeBuild", daemon=True)
+        worker.start()
+        worker.join(_RANGE_DEADLINE_SEC)
+        ok, message, extra = (outcome[0] if outcome else
+                              (False, "timed out reading this machine's logs", {}))
         body = dict(request)
         body["completed_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         if ok:

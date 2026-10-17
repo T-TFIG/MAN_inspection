@@ -40,6 +40,45 @@ def _query(start: datetime, end: datetime) -> str:
             f"and @SystemTime<='{_to_utc_text(end)}']]]")
 
 
+_QUERY_TIMEOUT_SEC = 45
+
+
+def _run_wevtutil(query: str, timeout: float) -> bytes:
+    """Run wevtutil with a hard deadline, output to a temp file.
+
+    subprocess.run(timeout=...) waits again for the pipes after killing the
+    child, which can block if the Event Log service is wedged; here we kill
+    and walk away. Output goes to a file (not a pipe) and stdin is closed,
+    which also avoids invalid-handle errors in a windowless frozen exe.
+    """
+    import os
+    import tempfile
+    import time
+
+    fd, out_path = tempfile.mkstemp(suffix="_wevt.xml")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            proc = subprocess.Popen(
+                ["wevtutil", "qe", "System", f"/q:{query}", "/f:xml", "/e:Events"],
+                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
+                creationflags=0x08000000)
+            deadline = time.time() + timeout
+            while proc.poll() is None:
+                if time.time() > deadline:
+                    proc.kill()
+                    return b""
+                time.sleep(0.2)
+            if proc.returncode != 0:
+                return b""
+        with open(out_path, "rb") as fh:
+            return fh.read()
+    finally:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+
+
 def collect(start: datetime, end: datetime) -> list[tuple[datetime, str]]:
     """(local time, label) for Windows events in [start, end] (naive local datetimes).
 
@@ -47,12 +86,10 @@ def collect(start: datetime, end: datetime) -> list[tuple[datetime, str]]:
     never break a log request.
     """
     try:
-        proc = subprocess.run(
-            ["wevtutil", "qe", "System", f"/q:{_query(start, end)}", "/f:xml", "/e:Events"],
-            capture_output=True, timeout=60, creationflags=0x08000000)
-        if proc.returncode != 0 or not proc.stdout.strip():
+        stdout = _run_wevtutil(_query(start, end), timeout=_QUERY_TIMEOUT_SEC)
+        if not stdout.strip():
             return []
-        root = ET.fromstring(proc.stdout.decode("utf-8", errors="replace"))
+        root = ET.fromstring(stdout.decode("utf-8", errors="replace"))
     except Exception:
         return []
 
