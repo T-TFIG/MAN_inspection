@@ -82,8 +82,16 @@ Write-Host "Installed to $TargetExe"
 # Remove a previous install of this task, if any, then register it fresh.
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-$action    = New-ScheduledTaskAction -Execute $TargetExe
-$trigger   = New-ScheduledTaskTrigger -AtLogOn
+$action      = New-ScheduledTaskAction -Execute $TargetExe
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+# A second trigger that re-fires every 30 minutes, indefinitely: if the app
+# ever exits on its own (crash, a stuck update, anything) nobody has to
+# notice and relaunch it by hand -- Task Scheduler does it, and every launch
+# already checks for an update on its own. MultipleInstances IgnoreNew below
+# means this is a no-op while a copy is already running, so it's harmless
+# the other 29 times out of 30.
+$repeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration ([TimeSpan]::MaxValue)
 # BUILTIN\Users + "Limited" run level: starts for whichever user logs on,
 # with no admin rights (this is a plain tray app, it doesn't need any).
 $principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Limited
@@ -92,11 +100,12 @@ $settings  = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+Register-ScheduledTask -TaskName $TaskName -Action $action `
+    -Trigger @($logonTrigger, $repeatTrigger) `
     -Principal $principal -Settings $settings `
-    -Description "Runs the MAN_inspection activity logger at logon for any user." | Out-Null
+    -Description "Runs the MAN_inspection activity logger at logon for any user, and re-launches it every 30 minutes if it isn't already running." | Out-Null
 
-Write-Host "Scheduled task '$TaskName' registered: starts at logon for any user."
+Write-Host "Scheduled task '$TaskName' registered: starts at logon, and every 30 min if not already running."
 
 # Start it right now too, for the currently logged-on user, so there's no
 # need to log off/on to see it working.
