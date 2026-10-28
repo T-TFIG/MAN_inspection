@@ -47,11 +47,8 @@ class App:
         # what state data_dir() is in, so this run always reaches the
         # threads below instead of risking another immediate re-check.
         if not updater.was_just_relaunched_from_update():
-            try:
-                if updater.check_and_update():
-                    return
-            except Exception:
-                pass
+            if self._check_for_update_with_retries():
+                return
         # We're proceeding with a normal startup (no update in flight from
         # THIS launch) — safe to sweep up any stuck swapper scripts from a
         # past attempt that never finished.
@@ -122,8 +119,39 @@ class App:
         prefix = "Log uploaded" if ok else "Upload not sent"
         self._tray.notify(f"{prefix}: {info}")
 
+    def _check_for_update_with_retries(self) -> bool:
+        """The startup update check, with a few retries a short delay apart.
+
+        Found on a real machine: it came up, sent one heartbeat on the old
+        version, and never updated -- while a manual kill-and-relaunch
+        seconds later updated correctly on the very first try. The most
+        likely explanation is a machine that just booted or just logged on
+        (the Scheduled Task's AtLogOn trigger) not having network back yet
+        for the single HEAD request this check makes; check_and_update()
+        has no retry of its own, so that one failure cost the full 6h until
+        the periodic loop's next attempt. A few quick retries here ride out
+        a startup network blip without meaningfully delaying a normal start.
+        """
+        for attempt in range(config.STARTUP_UPDATE_CHECK_ATTEMPTS):
+            try:
+                if updater.check_and_update():
+                    return True
+            except Exception:
+                pass
+            if attempt < config.STARTUP_UPDATE_CHECK_ATTEMPTS - 1:
+                time.sleep(config.STARTUP_UPDATE_CHECK_RETRY_SEC)
+        return False
+
     def _periodic_update_loop(self) -> None:
-        while not self._stopping.wait(config.UPDATE_CHECK_INTERVAL_SEC):
+        # The first wait is much shorter than the steady-state interval: if
+        # every startup retry above also failed (a longer outage, not just a
+        # boot-time blip), this is the real safety net -- waiting the full
+        # interval before ever checking again would otherwise strand the
+        # machine on the old version for up to 6h on nothing more than one
+        # bad network moment.
+        wait = config.UPDATE_RECHECK_SOON_SEC
+        while not self._stopping.wait(wait):
+            wait = config.UPDATE_CHECK_INTERVAL_SEC
             try:
                 if updater.check_and_update():
                     # New version is downloaded; shut down so it can take over.

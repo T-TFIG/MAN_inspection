@@ -36,6 +36,14 @@ REQUEST_POLL_INTERVAL_SEC = 15
 POLL_INTERVAL_SEC = 2.0          # how often we sample the foreground window
 IDLE_THRESHOLD_SEC = 60.0        # no keyboard/mouse for this long => "Idle"
 UPDATE_CHECK_INTERVAL_SEC = 6 * 60 * 60   # re-check for updates every 6 hours
+# A machine that just booted/logged on may not have network back yet for the
+# startup update check's one HEAD request. These ride out that window: a few
+# quick retries right at startup, and if all of those also fail, the
+# periodic loop's first follow-up comes much sooner than the steady-state
+# 6h interval instead of stranding the machine on the old version that long.
+STARTUP_UPDATE_CHECK_ATTEMPTS = 3
+STARTUP_UPDATE_CHECK_RETRY_SEC = 8
+UPDATE_RECHECK_SOON_SEC = 10 * 60
 
 
 def base_dir() -> str:
