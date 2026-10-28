@@ -241,17 +241,34 @@ def _spawn_swapper(new_path: str, cur_path: str) -> bool:
         # Proof-of-life for the parent: it won't exit until this exists.
         f'echo 1>"{marker}"\r\n'
         "ping -n 3 127.0.0.1 >NUL\r\n"
+        # Best-effort: force a full synchronous read of the freshly
+        # downloaded file before the first move attempt. If antivirus scans
+        # a file on first access (common), this makes that scan happen here
+        # -- and wait for it to finish, since the AV filter driver blocks
+        # the read until it's done -- rather than racing the move itself.
+        # Not guaranteed (some AV scans are gated differently), which is why
+        # the retry loop below is still the real safety net.
+        f'certutil -hashfile "{new_path}" SHA256 >NUL 2>&1\r\n'
         "set \"tries=0\"\r\n"
         ":trymove\r\n"
         f'move /Y "{new_path}" "{cur_path}" >NUL 2>&1\r\n'
         "if errorlevel 1 (\r\n"
         "  set /a tries+=1\r\n"
-        "  if %tries% GEQ 20 goto relaunch\r\n"
+        "  if %tries% GEQ 90 goto relaunch\r\n"
         # Windows won't overwrite an exe that is still running. If the old
         # process hasn't exited a few seconds after asking it to (seen on a
         # real machine: it lingered past all 20 retries, so the swap never
         # happened and the OLD version was relaunched), end it ourselves.
         f'  if %tries% EQU 4 taskkill /F /IM "{os.path.basename(cur_path)}" >NUL 2>&1\r\n'
+        # Confirmed on a real client machine: the OLD process was not the
+        # blocker (taskkill above should clear that) -- the freshly
+        # downloaded .new file was still sitting there, unmoved, a good
+        # 25+ seconds after download finished, well past the previous ~40s
+        # total budget. Corporate antivirus/EDR scanning a ~23MB exe before
+        # releasing it is the leading explanation, and a scan like that can
+        # reasonably take longer than that. 90 tries x 2s (~3 minutes) gives
+        # a slow scan real room instead of giving up and falling back to
+        # relaunching the old version.
         "  ping -n 2 127.0.0.1 >NUL\r\n"
         "  goto trymove\r\n"
         ")\r\n"
