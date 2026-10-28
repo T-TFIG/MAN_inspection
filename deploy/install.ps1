@@ -80,7 +80,12 @@ for ($i = 1; $i -le $attempts; $i++) {
 Write-Host "Installed to $TargetExe"
 
 # Remove a previous install of this task, if any, then register it fresh.
+# Unregister can return before Windows has actually released the task's
+# backing file -- re-running this script (the exact case Register-
+# ScheduledTask then fails on: "The process cannot access the file because
+# it is being used by another process") raced this and failed outright.
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
 
 $action      = New-ScheduledTaskAction -Execute $TargetExe
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
@@ -100,10 +105,20 @@ $settings  = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
 
-Register-ScheduledTask -TaskName $TaskName -Action $action `
-    -Trigger @($logonTrigger, $repeatTrigger) `
-    -Principal $principal -Settings $settings `
-    -Description "Runs the MAN_inspection activity logger at logon for any user, and re-launches it every 30 minutes if it isn't already running." | Out-Null
+$attempts = 5
+for ($i = 1; $i -le $attempts; $i++) {
+    try {
+        Register-ScheduledTask -TaskName $TaskName -Action $action `
+            -Trigger @($logonTrigger, $repeatTrigger) `
+            -Principal $principal -Settings $settings `
+            -Description "Runs the MAN_inspection activity logger at logon for any user, and re-launches it every 30 minutes if it isn't already running." | Out-Null
+        break
+    } catch {
+        if ($i -ge $attempts) { throw }
+        Write-Host "  Task file still locked, retrying ($i/$attempts)..."
+        Start-Sleep -Seconds 2
+    }
+}
 
 Write-Host "Scheduled task '$TaskName' registered: starts at logon, and every 30 min if not already running."
 
