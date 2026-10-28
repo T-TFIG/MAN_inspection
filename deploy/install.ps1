@@ -91,7 +91,7 @@ $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
 # means this is a no-op while a copy is already running, so it's harmless
 # the other 29 times out of 30.
 $repeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration ([TimeSpan]::MaxValue)
+    -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration (New-TimeSpan -Days 3650)
 # BUILTIN\Users + "Limited" run level: starts for whichever user logs on,
 # with no admin rights (this is a plain tray app, it doesn't need any).
 $principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Limited
